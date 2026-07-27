@@ -1,6 +1,6 @@
 /* ---------- Data layer ---------- */
 
-const APP_VERSION = 'v9 · ' + '2026-07-27';
+const APP_VERSION = 'v10 · ' + '2026-07-27';
 const STORAGE_KEY = 'tripPlannerData_v1';
 
 const DAY_TYPES = [
@@ -622,7 +622,7 @@ function toast(msg) {
 
 /* ---------- Navigation state ---------- */
 
-let currentView = 'dashboard'; // dashboard | route | stop | day | budget | settings
+let currentView = 'dashboard'; // dashboard | route | stop | day | week | budget | settings
 let currentStopId = null;
 let currentStopTab = 'days'; // days | attractions | stay | transport | map | info
 let currentDayIndex = null;
@@ -641,6 +641,8 @@ function openStop(id) {
   currentStopId = id;
   currentStopTab = 'days';
   expandedDays = new Set();
+  aiReviewItems = null;
+  aiReviewStopId = null;
   document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.remove('active'));
   render();
 }
@@ -649,6 +651,12 @@ function openDayPage(stopId, dayIndex) {
   currentView = 'day';
   currentStopId = stopId;
   currentDayIndex = dayIndex;
+  document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.remove('active'));
+  render();
+}
+
+function openWeekPage() {
+  currentView = 'week';
   document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.remove('active'));
   render();
 }
@@ -715,10 +723,12 @@ function render() {
   else if (currentView === 'route') main.innerHTML = renderRoute();
   else if (currentView === 'stop') main.innerHTML = renderStopWorkspace();
   else if (currentView === 'day') main.innerHTML = renderDayPage();
+  else if (currentView === 'week') main.innerHTML = renderWeekPage();
   else if (currentView === 'budget') main.innerHTML = renderBudget();
   else if (currentView === 'settings') main.innerHTML = renderSettings();
   attachHandlers();
   if (currentView === 'day') attachDayPageMapHandler();
+  if (currentView === 'week') attachWeekPageHandlers();
 }
 
 /* ---------- Dashboard ---------- */
@@ -768,6 +778,7 @@ function renderDashboard() {
     <div class="section-title">Today &amp; tomorrow</div>
     ${renderTodayCard(todayEntry, 'Today')}
     ${renderTodayCard(tomorrowEntry, 'Tomorrow')}
+    <button class="week-link" data-action="open-week">View full week ›</button>
 
     ${workWidget}
 
@@ -888,6 +899,72 @@ function computeUrgentItems() {
     }
   });
   return items;
+}
+
+/* ---------- This Week page ---------- */
+// A proper 7-day-at-a-glance view (today + next 6 real calendar days), since
+// that's the unit you actually plan in — a week of work hours, a week to
+// the next Shabbat. Each row taps straight into that day's full page.
+
+const DAY_TYPE_COLOR = {
+  'travel': '#c9a24a', 'work-base': '#5b8fa8', 'light-local': '#7fae8e',
+  'intensive-excursion': '#c2704f', 'rest-family': '#9b8ac9', 'shabbat-holiday': '#2b6777',
+  'buffer': '#b3ab98', 'unset': '#cfc7b0'
+};
+
+function renderWeekPage() {
+  const startIso = todayIso();
+  const rows = [];
+  for (let d = 0; d < 7; d++) {
+    const dateIso = addDays(startIso, d);
+    const entry = resolveRealDate(dateIso);
+    const dow = new Date(dateIso + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short' });
+    const dayNum = new Date(dateIso + 'T00:00:00').getDate();
+
+    if (!entry) {
+      rows.push(`
+        <div class="card week-row" style="cursor:default">
+          <div class="week-row-date"><span class="dow">${dow}</span>${dayNum}</div>
+          <div class="week-row-main"><div class="week-row-meta">Outside your planned trip dates</div></div>
+        </div>`);
+      continue;
+    }
+
+    const { stop, dayIndex } = entry;
+    const withDates = stopWithDatesById(stop.id);
+    const calMap = computeShabbatChagMap(stop, withDates);
+    const flag = getDayFlag(calMap, dateIso);
+    const dayType = stop.dayTypes[dayIndex] || 'unset';
+    const dayTypeLabel = (DAY_TYPES.find((t) => t.value === dayType) || {}).label || 'Not set';
+    const conflicts = detectDayConflicts(stop, dayIndex, flag);
+    const accom = (stop.accommodations || []).find((a) => dayIndex >= a.startDayIndex && dayIndex < a.startDayIndex + a.nights);
+    const scheduled = (stop.attractionBank || []).filter((a) => a.scheduledDay === dayIndex);
+    const wstats = getWorkDefaults().enabled ? computeDayWorkStats(stop, dayIndex, flag) : null;
+
+    rows.push(`
+      <div class="card week-row" data-open-day="${stop.id}" data-day="${dayIndex}">
+        <div class="week-row-date"><span class="dow">${dow}</span>${dayNum}</div>
+        <span class="week-type-dot" style="background:${DAY_TYPE_COLOR[dayType] || '#ccc'}" title="${escapeAttr(dayTypeLabel)}"></span>
+        <div class="week-row-main">
+          <div class="week-row-country">${escapeHtml(stop.country)} · Day ${dayIndex + 1}</div>
+          <div class="week-row-meta">${escapeHtml(dayTypeLabel)}${accom ? ' · 🛏 ' + escapeHtml(accom.name) : ' · no stay set'}${scheduled.length ? ' · ' + scheduled.length + ' planned' : ''}</div>
+        </div>
+        ${wstats && wstats.targetMinutes > 0 ? `<span class="week-row-work">${(wstats.creditedMinutes / 60).toFixed(1)}/${(wstats.targetMinutes / 60).toFixed(1)}h</span>` : ''}
+        ${conflicts.length ? `<span class="week-row-conflict" title="${conflicts.length} conflict(s)">⚠</span>` : ''}
+        <span class="chevron">›</span>
+      </div>`);
+  }
+
+  return `
+    <button class="btn-back" id="btn-back-to-dashboard">‹ Dashboard</button>
+    <div class="section-title">This week</div>
+    ${rows.join('')}
+  `;
+}
+
+function attachWeekPageHandlers() {
+  const backBtn = document.getElementById('btn-back-to-dashboard');
+  if (backBtn) backBtn.addEventListener('click', () => setView('dashboard'));
 }
 
 /* ---------- Route (country-level list) ---------- */
@@ -1517,8 +1594,9 @@ function renderAttractionsTab(stop) {
     <div class="card">
       <label>Paste the AI's full reply here</label>
       <textarea id="ai-import-text" rows="6" placeholder="Paste the AI's structured reply here (or a plain list — that still works too)"></textarea>
-      <button class="btn btn-primary" id="btn-import-ai-list" style="margin-top:8px">Import as attractions</button>
+      <button class="btn btn-primary" id="btn-import-ai-list" style="margin-top:8px">Preview import</button>
     </div>
+    <div id="ai-review-slot">${(aiReviewItems && aiReviewStopId === stop.id) ? renderAiReviewSection(stop) : ''}</div>
 
     <div class="section-title">Bank</div>
     ${rows}
@@ -1634,6 +1712,83 @@ function parseAiImportText(text) {
     else if (!gs) attr.guidedOrSelf = 'Not set';
     return attr;
   }).filter(Boolean);
+}
+
+/* ----- Batch review before saving AI-parsed attractions -----
+   Parsing happens immediately, but nothing is written to the attraction bank
+   until you review each item — edit a mis-parsed name, uncheck ones you don't
+   want — and explicitly commit. Rejects are simply discarded, never saved. */
+
+let aiReviewItems = null;
+let aiReviewStopId = null;
+
+function renderAiReviewSection(stop) {
+  if (!aiReviewItems || !aiReviewItems.length) return '';
+  const includedCount = aiReviewItems.filter((it) => it._include).length;
+  const rows = aiReviewItems.map((it, idx) => `
+    <div class="card review-item ${it._include ? '' : 'review-item-excluded'}">
+      <label class="review-include-row">
+        <input type="checkbox" data-action="review-toggle" data-idx="${idx}" ${it._include ? 'checked' : ''} />
+        <input type="text" data-action="review-name" data-idx="${idx}" value="${escapeAttr(it.name)}" class="review-name-input" />
+      </label>
+      ${it.description ? `<div class="hint">${escapeHtml(it.description)}</div>` : ''}
+      ${it.location ? `<div class="hint">📍 ${escapeHtml(it.location)}</div>` : ''}
+      ${it.gettingThere ? `<div class="hint">🚗 ${escapeHtml(it.gettingThere)}</div>` : ''}
+      ${it.whatToBring ? `<div class="hint">🎒 ${escapeHtml(it.whatToBring)}</div>` : ''}
+      ${it.notes ? `<div class="hint">${escapeHtml(it.notes)}</div>` : ''}
+    </div>
+  `).join('');
+
+  return `
+    <div class="review-banner">
+      <b>Review before saving</b> — ${aiReviewItems.length} suggestion${aiReviewItems.length === 1 ? '' : 's'} parsed, ${includedCount} will be added. Edit names inline, untick anything you don't want.
+    </div>
+    ${rows}
+    <div class="form-actions" style="margin:10px 0 20px">
+      <button class="btn btn-primary" id="btn-commit-ai-review">Add ${includedCount} attraction${includedCount === 1 ? '' : 's'}</button>
+      <button class="btn btn-secondary" id="btn-cancel-ai-review">Discard all</button>
+    </div>
+  `;
+}
+
+function attachAiReviewHandlers(stop) {
+  if (!aiReviewItems || aiReviewStopId !== stop.id) return;
+
+  document.querySelectorAll('[data-action="review-toggle"]').forEach((cb) => cb.addEventListener('change', () => {
+    aiReviewItems[Number(cb.dataset.idx)]._include = cb.checked;
+    // Only the banner count and button label need updating — re-render the
+    // whole review slot rather than the whole tab, so typing elsewhere isn't disrupted.
+    document.getElementById('ai-review-slot').innerHTML = renderAiReviewSection(stop);
+    attachAiReviewHandlers(stop);
+  }));
+
+  document.querySelectorAll('[data-action="review-name"]').forEach((inp) => inp.addEventListener('input', () => {
+    aiReviewItems[Number(inp.dataset.idx)].name = inp.value;
+  }));
+
+  const commitBtn = document.getElementById('btn-commit-ai-review');
+  if (commitBtn) commitBtn.addEventListener('click', () => {
+    const toAdd = aiReviewItems.filter((it) => it._include);
+    if (!toAdd.length) { toast('Nothing selected to add.'); return; }
+    pushUndo('import attractions from AI');
+    toAdd.forEach((it) => {
+      const clean = Object.assign(defaultAttraction(), it, { id: uid('attr') });
+      delete clean._include;
+      stop.attractionBank.push(clean);
+    });
+    saveData();
+    toastWithUndo(`Added ${toAdd.length} attraction${toAdd.length === 1 ? '' : 's'}.`);
+    aiReviewItems = null;
+    aiReviewStopId = null;
+    render();
+  });
+
+  const cancelBtn = document.getElementById('btn-cancel-ai-review');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => {
+    aiReviewItems = null;
+    aiReviewStopId = null;
+    render();
+  });
 }
 
 /* ----- Stay tab (accommodation) ----- */
@@ -2466,6 +2621,8 @@ function attachHandlers() {
   document.querySelectorAll('[data-goto]').forEach((b) => b.addEventListener('click', () => setView(b.dataset.goto)));
   document.querySelectorAll('[data-open-stop]').forEach((b) => b.addEventListener('click', () => openStop(b.dataset.openStop)));
   document.querySelectorAll('[data-open-day]').forEach((b) => b.addEventListener('click', () => openDayPage(b.dataset.openDay, Number(b.dataset.day))));
+  const weekLink = document.querySelector('[data-action="open-week"]');
+  if (weekLink) weekLink.addEventListener('click', openWeekPage);
   document.querySelectorAll('[data-jump-stop], [data-jump-budget]').forEach((b) => b.addEventListener('click', () => {
     if (b.dataset.jumpBudget) { setView('budget'); budgetSubTab = 'flights'; render(); return; }
     if (b.dataset.jumpStop) {
@@ -2733,14 +2890,12 @@ function attachAttractionsHandlers(stop) {
     const text = document.getElementById('ai-import-text').value;
     const parsed = parseAiImportText(text);
     if (!parsed.length) { toast('Nothing to import.'); return; }
-    parsed.forEach((attr) => {
-      attr.id = uid('attr');
-      stop.attractionBank.push(attr);
-    });
-    saveData();
-    toast(`Imported ${parsed.length} attraction${parsed.length === 1 ? '' : 's'}.`);
+    aiReviewItems = parsed.map((a) => Object.assign(a, { _include: true }));
+    aiReviewStopId = stop.id;
     render();
   });
+
+  attachAiReviewHandlers(stop);
 }
 
 function wireAttractionForm(stop, existing) {
