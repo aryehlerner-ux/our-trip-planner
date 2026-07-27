@@ -292,3 +292,139 @@ nav.bottom-nav button.active {
 .toast.show { opacity: 1; }
 
 .hidden { display: none !important; }
+
+/* ---- Stage 2 additions ---- */
+
+.stop-card { cursor: pointer; }
+.stop-main .country { display: flex; align-items: center; gap: 6px; }
+.chevron { color: var(--teal); opacity: 0.5; font-size: 1.2rem; padding-left: 6px; }
+
+.btn-back {
+  border: none;
+  background: none;
+  color: var(--teal-dark);
+  font-weight: 600;
+  font-size: 0.9rem;
+  padding: 4px 0 10px;
+  cursor: pointer;
+}
+
+.stop-header { margin-bottom: 12px; }
+.stop-header .country { font-size: 1.3rem; font-weight: 700; }
+.stop-header .dates { font-size: 0.85rem; opacity: 0.65; margin-top: 2px; }
+.map-link {
+  display: inline-block;
+  font-size: 0.8rem;
+  color: var(--teal);
+  margin-top: 4px;
+  text-decoration: none;
+  border-bottom: 1px dashed var(--teal);
+}
+
+.stop-tabs {
+  display: flex;
+  overflow-x: auto;
+  gap: 6px;
+  margin-bottom: 14px;
+  padding-bottom: 4px;
+}
+
+.stop-tab {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+  opacity: 0.7;
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 0.82rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.stop-tab.active {
+  background: var(--teal);
+  border-color: var(--teal);
+  color: #fff;
+  opacity: 1;
+  font-weight: 600;
+}
+
+.day-card { display: block; }
+.day-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.day-num { font-weight: 700; font-size: 0.95rem; }
+.day-card select.day-type-select {
+  width: auto;
+  max-width: 170px;
+  font-size: 0.78rem;
+  padding: 6px 8px;
+}
+.day-accom {
+  font-size: 0.82rem;
+  color: var(--teal-dark);
+  margin-bottom: 8px;
+}
+.hint-inline { opacity: 0.55; font-size: 0.82rem; }
+.hint { font-size: 0.8rem; opacity: 0.65; margin: 4px 0; }
+
+.day-activities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.activity-chip {
+  background: var(--sand);
+  color: var(--teal-dark);
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 0.78rem;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chip-x {
+  border: none;
+  background: none;
+  color: var(--teal-dark);
+  opacity: 0.6;
+  cursor: pointer;
+  font-size: 0.8rem;
+  padding: 0;
+}
+
+.picker-box {
+  background: var(--paper);
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  margin-top: 8px;
+}
+.picker-box label { font-size: 0.72rem; opacity: 0.65; margin: 8px 0 4px; display: block; }
+.picker-box label:first-child { margin-top: 0; }
+.picker-box select { margin-bottom: 8px; }
+
+.attr-card, .stay-card { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.attr-main { flex: 1; min-width: 0; }
+.attr-name { font-weight: 700; font-size: 0.95rem; }
+.attr-status { font-size: 0.78rem; opacity: 0.6; margin-top: 2px; }
+
+textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 0.88rem;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: inherit;
+  resize: vertical;
+}
