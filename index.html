@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Family Trip Planner</title>
+<link rel="manifest" href="./manifest.json" />
+<meta name="theme-color" content="#2b6777" />
+<link rel="apple-touch-icon" href="./icon-192.png" />
+<link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">Family Trip Planner<small>Stage 1 — Route &amp; backup</small></div>
+</header>
+
+<main id="main"></main>
+
+<div class="toast" id="toast"></div>
+
+<nav class="bottom-nav">
+  <button data-view="dashboard" class="active">
+    <span class="glyph">⌂</span><span>Dashboard</span>
+  </button>
+  <button data-view="route">
+    <span class="glyph">🗺</span><span>Route</span>
+  </button>
+  <button data-view="settings">
+    <span class="glyph">⚙</span><span>Settings</span>
+  </button>
+</nav>
+
+<script src="./app.js"></script>
+</body>
+</html>
