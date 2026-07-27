@@ -1,6 +1,6 @@
 /* ---------- Data layer ---------- */
 
-const APP_VERSION = 'v11 · ' + '2026-07-27';
+const APP_VERSION = 'v12 · ' + '2026-07-27';
 const STORAGE_KEY = 'tripPlannerData_v1';
 
 const DAY_TYPES = [
@@ -644,6 +644,7 @@ function openStop(id) {
   expandedDays = new Set();
   aiReviewItems = null;
   aiReviewStopId = null;
+  reviewExpanded = new Set();
   document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.remove('active'));
   render();
 }
@@ -1696,25 +1697,35 @@ function renderAttractionForm(existing) {
 
 function buildAiPrompt(stop) {
   const withDates = stopWithDatesById(stop.id);
+  const existingNames = (stop.attractionBank || []).map((a) => a.name).filter(Boolean);
+  const existingLine = existingNames.length
+    ? `\n- Already on our list, please don't repeat these: ${existingNames.join(', ')}`
+    : '';
+
   return `I'm planning a family trip and need attraction/activity suggestions for ${stop.country}.
+
 Context:
 - Dates: ${withDates.startDate ? formatDate(withDates.startDate) + ' to ' + formatDate(withDates.endDate) : 'not yet set'} (${stop.durationDays} days)
 - Travelers: ${travelerProfileLine()}
-- Style: slow travel, dramatic nature, authentic local culture, villages, markets, community-run tourism; avoid staged/touristy experiences, shopping, and nightlife
+- Style: slow travel, dramatic nature, authentic local culture, villages, markets, crafts, indigenous-led or community-run tourism; avoid staged/touristy experiences, shopping malls, and nightlife
+- Budget-conscious — prefer a realistic mix, not just premium/expensive options
 - Practical needs: road quality, child safety, nap disruption, and whether private transport helps should factor into suggestions
-- We keep Shabbat (no Friday-Saturday travel) and would like Chabad/kosher notes if relevant
+- We keep Shabbat (no Friday-Saturday travel) and would like Chabad/kosher notes if relevant${existingLine}
 
-Please suggest 6-10 specific attractions/activities in ${stop.country} that fit this. IMPORTANT — reply using exactly this format for each one, so I can import it directly into my planning app:
+Please suggest 8-10 specific attractions/activities in ${stop.country} that fit this, covering a mix of nature, culture, food/market, and easy/light options — not all intensive excursions.
 
-### Attraction Name
-What: one or two sentence description of what it is
-Where: specific place/neighborhood name (for a map search)
-Tour or self-guided: Guided tour recommended / Can visit independently / Either works
-Getting there: how to get there from a typical base, and travel time
-What to bring: brief list (gear, altitude meds, cash, etc.)
-Notes: child-suitability, booking-ahead needs, or anything else worth knowing
+VERY IMPORTANT — formatting instructions, please follow exactly:
+Reply in plain text only. Do NOT use markdown formatting — no headers (no #), no bold (no **), no bullet symbols. Just plain lines of text exactly as shown below, because I'm copying your reply directly into an app that reads this exact structure:
 
-Repeat that block for each suggestion. Please don't add any other text before, between, or after the blocks.`;
+Attraction: [name of the place or activity]
+What: [one or two sentence description of what it is]
+Where: [specific place/neighborhood name, for a map search]
+Tour or self-guided: [Guided tour recommended / Can visit independently / Either works]
+Getting there: [how to get there from a typical base, and travel time]
+What to bring: [brief list — gear, altitude meds, cash, etc.]
+Notes: [child-suitability, booking-ahead needs, or anything else worth knowing]
+
+Leave one blank line between each attraction. Start every single one with the word "Attraction:" exactly like that, in plain text — this is how my app finds where each new suggestion starts. Please don't add any introduction, summary, or closing remarks — just the list of attractions in that exact format, nothing else.`;
 }
 
 /* ----- Smart parser for the structured AI reply ----- */
@@ -1723,15 +1734,18 @@ Repeat that block for each suggestion. Please don't add any other text before, b
 // for plain pasted lists that don't use that format, so nothing is ever lost.
 
 function parseAiImportText(text) {
-  const hasStructured = /^###\s+/m.test(text);
-  if (!hasStructured) {
-    return text.split('\n')
-      .map((l) => l.replace(/^[\s\-•*\d.)]+/, '').trim())
-      .filter((l) => l.length > 0)
-      .map((name) => Object.assign(defaultAttraction(), { name, source: 'ai-import' }));
-  }
+  // Strip markdown decoration that may or may not have survived copy-paste
+  // (headers/bold render away when copied from a formatted chat UI, but
+  // remain if pasted as raw markdown source) — normalize both cases the same way.
+  const cleanLine = (l) => l
+    .replace(/\*\*/g, '')
+    .replace(/^#{1,6}\s*/, '')
+    .replace(/^\d+[.)]\s*/, '')
+    .replace(/^[-•▪●]\s*/, '')
+    .trim();
 
-  const blocks = text.split(/^###\s+/m).slice(1); // drop any preamble before the first ###
+  const rawLines = text.split('\n').map(cleanLine);
+
   const fieldPatterns = [
     ['description', /^what:\s*(.*)$/i],
     ['location', /^where:\s*(.*)$/i],
@@ -1740,33 +1754,97 @@ function parseAiImportText(text) {
     ['whatToBring', /^what to bring:\s*(.*)$/i],
     ['notes', /^notes:\s*(.*)$/i]
   ];
+  const titlePattern = /^attraction(?:\s*(?:name|title))?:\s*(.*)$/i;
 
-  return blocks.map((block) => {
-    const lines = block.split('\n').map((l) => l.trim()).filter((l) => l.length);
-    if (!lines.length) return null;
-    const attr = Object.assign(defaultAttraction(), { name: lines[0], source: 'ai-import' });
-    for (const line of lines.slice(1)) {
+  const hasExplicitTitles = rawLines.some((l) => titlePattern.test(l));
+  const hasAnyFieldLabels = rawLines.some((l) => fieldPatterns.some(([, p]) => p.test(l)));
+
+  // Best case: the "Attraction: / What: / Where: ..." format came through
+  // (with or without markdown decoration — cleanLine already normalized it).
+  if (hasExplicitTitles) {
+    const attractions = [];
+    let current = null;
+    rawLines.forEach((line) => {
+      if (!line) return;
+      const titleMatch = line.match(titlePattern);
+      if (titleMatch && titleMatch[1]) {
+        if (current && current.name) attractions.push(current);
+        current = Object.assign(defaultAttraction(), { name: titleMatch[1].trim(), source: 'ai-import' });
+        return;
+      }
+      if (!current) return; // ignore any preamble before the first "Attraction:" line
       let matched = false;
       for (const [field, pattern] of fieldPatterns) {
         const m = line.match(pattern);
         if (m) {
-          attr[field] = (attr[field] ? attr[field] + ' ' : '') + m[1].trim();
+          current[field] = (current[field] ? current[field] + ' ' : '') + m[1].trim();
           matched = true;
           break;
         }
       }
-      if (!matched && line) {
-        attr.notes = attr.notes ? attr.notes + ' ' + line : line;
+      if (!matched) current.notes = current.notes ? current.notes + ' ' + line : line;
+    });
+    if (current && current.name) attractions.push(current);
+    return normalizeGuided(attractions);
+  }
+
+  // Next best: no "Attraction:" labels, but the field labels (What:/Where:/etc.)
+  // are present — treat the first unlabeled line before each run of fields as
+  // that item's title.
+  if (hasAnyFieldLabels) {
+    const attractions = [];
+    let current = null;
+    rawLines.forEach((line) => {
+      if (!line) return;
+      let matched = false;
+      for (const [field, pattern] of fieldPatterns) {
+        const m = line.match(pattern);
+        if (m) {
+          if (!current) current = Object.assign(defaultAttraction(), { name: 'Untitled suggestion', source: 'ai-import' });
+          current[field] = (current[field] ? current[field] + ' ' : '') + m[1].trim();
+          matched = true;
+          break;
+        }
       }
-    }
-    // normalize guidedOrSelf to one of our select options where possible
+      if (matched) return;
+      // An unlabeled line: if the current item already has fields filled,
+      // this line starts a NEW item (its title). Otherwise it's this item's title.
+      const hasContent = current && (current.description || current.location || current.gettingThere || current.whatToBring || current.notes);
+      if (!current || hasContent) {
+        if (current) attractions.push(current);
+        current = Object.assign(defaultAttraction(), { name: line, source: 'ai-import' });
+      } else {
+        current.name = (current.name === 'Untitled suggestion' ? line : current.name + ' ' + line).trim();
+      }
+    });
+    if (current) attractions.push(current);
+    return normalizeGuided(attractions);
+  }
+
+  // Fallback: no recognizable field structure at all. Group by BLANK-LINE
+  // separated paragraphs rather than one-attraction-per-line — a title
+  // followed by a description line (very common in a casual AI reply) then
+  // becomes one attraction (name + description), not two garbled entries.
+  const paragraphs = text.split(/\n\s*\n/).map((p) => p.split('\n').map(cleanLine).filter(Boolean)).filter((p) => p.length);
+  return paragraphs.map((pLines) => {
+    const [name, ...rest] = pLines;
+    return Object.assign(defaultAttraction(), {
+      name: name.replace(/^[\s\-•*\d.)]+/, '').trim(),
+      description: rest.join(' ').trim(),
+      source: 'ai-import'
+    });
+  });
+}
+
+function normalizeGuided(attractions) {
+  attractions.forEach((attr) => {
     const gs = (attr.guidedOrSelf || '').toLowerCase();
     if (gs.includes('guided')) attr.guidedOrSelf = 'Guided tour recommended';
     else if (gs.includes('independent') || gs.includes('alone') || gs.includes('self')) attr.guidedOrSelf = 'Can visit independently';
     else if (gs.includes('either')) attr.guidedOrSelf = 'Either works';
     else if (!gs) attr.guidedOrSelf = 'Not set';
-    return attr;
-  }).filter(Boolean);
+  });
+  return attractions;
 }
 
 /* ----- Batch review before saving AI-parsed attractions -----
@@ -1777,26 +1855,45 @@ function parseAiImportText(text) {
 let aiReviewItems = null;
 let aiReviewStopId = null;
 
+let reviewExpanded = new Set();
+
 function renderAiReviewSection(stop) {
   if (!aiReviewItems || !aiReviewItems.length) return '';
   const includedCount = aiReviewItems.filter((it) => it._include).length;
-  const rows = aiReviewItems.map((it, idx) => `
+  const rows = aiReviewItems.map((it, idx) => {
+    const isOpen = reviewExpanded.has(idx);
+    return `
     <div class="card review-item ${it._include ? '' : 'review-item-excluded'}">
       <label class="review-include-row">
         <input type="checkbox" data-action="review-toggle" data-idx="${idx}" ${it._include ? 'checked' : ''} />
-        <input type="text" data-action="review-name" data-idx="${idx}" value="${escapeAttr(it.name)}" class="review-name-input" />
+        <input type="text" data-action="review-field" data-field="name" data-idx="${idx}" value="${escapeAttr(it.name)}" class="review-name-input" />
+        <button class="icon-btn" data-action="review-expand" data-idx="${idx}">${isOpen ? '▾' : '✎'}</button>
       </label>
-      ${it.description ? `<div class="hint">${escapeHtml(it.description)}</div>` : ''}
-      ${it.location ? `<div class="hint">📍 ${escapeHtml(it.location)}</div>` : ''}
-      ${it.gettingThere ? `<div class="hint">🚗 ${escapeHtml(it.gettingThere)}</div>` : ''}
-      ${it.whatToBring ? `<div class="hint">🎒 ${escapeHtml(it.whatToBring)}</div>` : ''}
-      ${it.notes ? `<div class="hint">${escapeHtml(it.notes)}</div>` : ''}
+      ${!isOpen ? `
+        ${it.description ? `<div class="hint">${escapeHtml(it.description)}</div>` : ''}
+        ${it.location ? `<div class="hint">📍 ${escapeHtml(it.location)}</div>` : ''}
+        ${it.gettingThere ? `<div class="hint">🚗 ${escapeHtml(it.gettingThere)}</div>` : ''}
+        ${it.whatToBring ? `<div class="hint">🎒 ${escapeHtml(it.whatToBring)}</div>` : ''}
+        ${it.notes ? `<div class="hint">${escapeHtml(it.notes)}</div>` : ''}
+      ` : `
+        <label class="hint" style="display:block;margin-top:6px">What</label>
+        <textarea data-action="review-field" data-field="description" data-idx="${idx}" rows="2">${escapeHtml(it.description || '')}</textarea>
+        <label class="hint" style="display:block;margin-top:6px">Where</label>
+        <input type="text" data-action="review-field" data-field="location" data-idx="${idx}" value="${escapeAttr(it.location || '')}" />
+        <label class="hint" style="display:block;margin-top:6px">Getting there</label>
+        <input type="text" data-action="review-field" data-field="gettingThere" data-idx="${idx}" value="${escapeAttr(it.gettingThere || '')}" />
+        <label class="hint" style="display:block;margin-top:6px">What to bring</label>
+        <input type="text" data-action="review-field" data-field="whatToBring" data-idx="${idx}" value="${escapeAttr(it.whatToBring || '')}" />
+        <label class="hint" style="display:block;margin-top:6px">Notes</label>
+        <textarea data-action="review-field" data-field="notes" data-idx="${idx}" rows="2">${escapeHtml(it.notes || '')}</textarea>
+      `}
     </div>
-  `).join('');
+  `;
+  }).join('');
 
   return `
     <div class="review-banner">
-      <b>Review before saving</b> — ${aiReviewItems.length} suggestion${aiReviewItems.length === 1 ? '' : 's'} parsed, ${includedCount} will be added. Edit names inline, untick anything you don't want.
+      <b>Review before saving</b> — ${aiReviewItems.length} suggestion${aiReviewItems.length === 1 ? '' : 's'} parsed, ${includedCount} will be added. Tap ✎ to edit any field, untick anything you don't want.
     </div>
     ${rows}
     <div class="form-actions" style="margin:10px 0 20px">
@@ -1817,9 +1914,19 @@ function attachAiReviewHandlers(stop) {
     attachAiReviewHandlers(stop);
   }));
 
-  document.querySelectorAll('[data-action="review-name"]').forEach((inp) => inp.addEventListener('input', () => {
-    aiReviewItems[Number(inp.dataset.idx)].name = inp.value;
+  document.querySelectorAll('[data-action="review-expand"]').forEach((b) => b.addEventListener('click', () => {
+    const idx = Number(b.dataset.idx);
+    if (reviewExpanded.has(idx)) reviewExpanded.delete(idx); else reviewExpanded.add(idx);
+    document.getElementById('ai-review-slot').innerHTML = renderAiReviewSection(stop);
+    attachAiReviewHandlers(stop);
   }));
+
+  document.querySelectorAll('[data-action="review-field"]').forEach((inp) => {
+    const evt = inp.tagName === 'SELECT' ? 'change' : 'input';
+    inp.addEventListener(evt, () => {
+      aiReviewItems[Number(inp.dataset.idx)][inp.dataset.field] = inp.value;
+    });
+  });
 
   const commitBtn = document.getElementById('btn-commit-ai-review');
   if (commitBtn) commitBtn.addEventListener('click', () => {
@@ -1835,6 +1942,7 @@ function attachAiReviewHandlers(stop) {
     toastWithUndo(`Added ${toAdd.length} attraction${toAdd.length === 1 ? '' : 's'}.`);
     aiReviewItems = null;
     aiReviewStopId = null;
+    reviewExpanded = new Set();
     render();
   });
 
@@ -1842,6 +1950,7 @@ function attachAiReviewHandlers(stop) {
   if (cancelBtn) cancelBtn.addEventListener('click', () => {
     aiReviewItems = null;
     aiReviewStopId = null;
+    reviewExpanded = new Set();
     render();
   });
 }
