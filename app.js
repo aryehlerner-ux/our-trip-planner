@@ -1,6 +1,6 @@
 /* ---------- Data layer ---------- */
 
-const APP_VERSION = 'v8 · ' + '2026-07-27';
+const APP_VERSION = 'v9 · ' + '2026-07-27';
 const STORAGE_KEY = 'tripPlannerData_v1';
 
 const DAY_TYPES = [
@@ -35,7 +35,13 @@ function defaultData() {
       totalBudgetUSD: null,
       fxRates: null, // { base: 'USD', date: '...', rates: { PEN: 3.7, ... } }
       shabbatSettings: { candleLightingMins: 18, havdalahMethod: 'deg8.5' },
-      travelers: { adults: 2, children: 1 }
+      travelers: { adults: 2, children: 1 },
+      workDefaults: {
+        enabled: true,
+        wakeTime: '08:00',
+        bedtime: '21:00',
+        blocks: [ { startTime: '09:00', endTime: '11:00' }, { startTime: '21:00', endTime: '23:00' } ]
+      }
     },
     stops: [],
     expenses: [], // { id, category, stopId, description, amountLocal, currency, amountUSD, fxRateUsed, fxDate, date, notes }
@@ -58,6 +64,7 @@ function defaultStop() {
   return {
     id: '', country: '', durationDays: 14, notes: '',
     dayTypes: {},
+    workOverrides: {}, // { [dayIndex]: true } — explicitly skip the work target for that day
     daySchedule: {}, // { [dayIndex]: [ { id, type, label, startTime, endTime, attractionId, notes } ] }
     attractionBank: [],
     accommodations: [],
@@ -442,6 +449,148 @@ function getDayFlag(calMap, dateIso) {
   };
 }
 
+/* ---------- Work-hours system ----------
+   A global daily template (wake, work blocks, bedtime) applies to every day
+   automatically. It's virtual — never written into daySchedule — so editing
+   the template updates every day instantly, past and future. When a real
+   scheduled block overlaps a default work block, the work block is "interrupted"
+   (rendered underneath, credited hours reduced by the overlap) rather than
+   deleted or blocking the schedule. Overlapped hours are still owed, per your
+   call — the weekly ledger reflects that as a running balance, not a per-day
+   reset, so a shortfall carries until it's made up. */
+
+function getWorkDefaults() {
+  return (data.meta && data.meta.workDefaults) || defaultData().meta.workDefaults;
+}
+
+function workDefaultIntervals() {
+  const wd = getWorkDefaults();
+  if (!wd.enabled) return [];
+  return (wd.blocks || [])
+    .map((b) => ({ start: minutesFromTime(b.startTime), end: minutesFromTime(b.endTime), startTime: b.startTime, endTime: b.endTime }))
+    .filter((b) => b.start !== null && b.end !== null && b.end > b.start);
+}
+
+// A day counts toward the weekly target unless it's Friday/Saturday/a chag
+// (via the existing Shabbat flag), or you've explicitly marked it skipped.
+function isWorkEligibleDay(stop, dayIndex, flag) {
+  if (stop.workOverrides && stop.workOverrides[dayIndex]) return false;
+  if (flag && flag.restricted) return false;
+  return true;
+}
+
+// Credited minutes for one day: each default work interval contributes its
+// full duration minus whatever real (non-Work-type) block time overlaps it.
+// A manual "Work" block placed outside the defaults counts as bonus credit.
+function computeDayWorkStats(stop, dayIndex, flag) {
+  const eligible = isWorkEligibleDay(stop, dayIndex, flag);
+  const intervals = workDefaultIntervals();
+  if (!eligible || !intervals.length) return { targetMinutes: 0, creditedMinutes: 0, eligible, intervals };
+
+  const targetMinutes = intervals.reduce((sum, iv) => sum + (iv.end - iv.start), 0);
+  const blocks = (stop.daySchedule[dayIndex] || []);
+  let credited = 0;
+
+  intervals.forEach((iv) => {
+    let displaced = 0;
+    blocks.forEach((b) => {
+      if (b.type === 'Work') return; // an explicit work block here doesn't displace — it IS the work
+      const bs = minutesFromTime(b.startTime);
+      if (bs === null) return;
+      const be = minutesFromTime(b.endTime) !== null ? minutesFromTime(b.endTime) : bs;
+      const os = Math.max(iv.start, bs), oe = Math.min(iv.end, be);
+      if (oe > os) displaced += (oe - os);
+    });
+    credited += Math.max(0, (iv.end - iv.start) - displaced);
+  });
+
+  blocks.forEach((b) => {
+    if (b.type !== 'Work') return;
+    const bs = minutesFromTime(b.startTime);
+    if (bs === null) return;
+    const be = minutesFromTime(b.endTime) !== null ? minutesFromTime(b.endTime) : bs;
+    const overlapsDefault = intervals.some((iv) => bs < iv.end && be > iv.start);
+    if (!overlapsDefault) credited += Math.max(0, be - bs);
+  });
+
+  return { targetMinutes, creditedMinutes: credited, eligible, intervals };
+}
+
+// Flattens the whole trip (every stop, in route order) into one day-by-day
+// list with resolved calendar dates — the basis for both the weekly ledger
+// and for finding "today"/"tomorrow" against the real calendar.
+function buildTripDayList() {
+  const stopsWithDates = computeStopDates();
+  const list = [];
+  stopsWithDates.forEach((s) => {
+    const stop = stopById(s.id);
+    for (let i = 0; i < s.durationDays; i++) {
+      list.push({ stop, dayIndex: i, date: s.startDate ? addDays(s.startDate, i) : null });
+    }
+  });
+  return list;
+}
+
+function sundayOfWeek(dateIso) {
+  const d = new Date(dateIso + 'T00:00:00');
+  d.setDate(d.getDate() - d.getDay());
+  return isoFromGregDate(d);
+}
+
+// Weekly (Sunday-start) buckets across the whole trip, target vs. credited,
+// with a running cumulative balance — negative means hours owed, positive
+// means banked ahead. Computed fresh each call; trip length keeps this cheap.
+function buildWeeklyWorkLedger() {
+  const days = buildTripDayList().filter((d) => d.date);
+  const weeksMap = new Map();
+  days.forEach((d) => {
+    const key = sundayOfWeek(d.date);
+    if (!weeksMap.has(key)) weeksMap.set(key, { weekStart: key, targetMinutes: 0, creditedMinutes: 0 });
+    const withDates = stopWithDatesById(d.stop.id);
+    const calMap = computeShabbatChagMap(d.stop, withDates);
+    const flag = getDayFlag(calMap, d.date);
+    const stats = computeDayWorkStats(d.stop, d.dayIndex, flag);
+    const w = weeksMap.get(key);
+    w.targetMinutes += stats.targetMinutes;
+    w.creditedMinutes += stats.creditedMinutes;
+  });
+  const weeks = [...weeksMap.values()].sort((a, b) => a.weekStart.localeCompare(b.weekStart));
+  let cumulative = 0;
+  weeks.forEach((w) => {
+    w.deficitMinutes = w.targetMinutes - w.creditedMinutes;
+    cumulative += w.deficitMinutes;
+    w.cumulativeAfterMinutes = cumulative;
+  });
+  return { weeks, cumulativeBalanceMinutes: cumulative };
+}
+
+function formatHoursBalance(minutes) {
+  const hrs = Math.abs(minutes) / 60;
+  const label = hrs.toFixed(1) + 'h';
+  if (minutes > 0.5) return { text: label + ' owed', cls: 'owed' };
+  if (minutes < -0.5) return { text: label + ' banked ahead', cls: 'banked' };
+  return { text: 'on target', cls: 'ontarget' };
+}
+
+/* ---------- Resolving the real calendar date to a trip day ---------- */
+
+function todayIso() {
+  const d = new Date();
+  return isoFromGregDate(d);
+}
+
+function resolveRealDate(dateIso) {
+  const stopsWithDates = computeStopDates();
+  for (const s of stopsWithDates) {
+    if (!s.startDate) continue;
+    if (dateIso >= s.startDate && dateIso < s.endDate) {
+      const dayIndex = Math.round((new Date(dateIso + 'T00:00:00') - new Date(s.startDate + 'T00:00:00')) / 86400000);
+      return { stop: stopById(s.id), dayIndex, date: dateIso };
+    }
+  }
+  return null;
+}
+
 /* ---------- Toast ---------- */
 
 let toastTimer = null;
@@ -473,9 +622,10 @@ function toast(msg) {
 
 /* ---------- Navigation state ---------- */
 
-let currentView = 'dashboard'; // dashboard | route | stop | settings
+let currentView = 'dashboard'; // dashboard | route | stop | day | budget | settings
 let currentStopId = null;
-let currentStopTab = 'days'; // days | attractions | stay | transport | info
+let currentStopTab = 'days'; // days | attractions | stay | transport | map | info
+let currentDayIndex = null;
 
 function setView(view) {
   currentView = view;
@@ -491,6 +641,14 @@ function openStop(id) {
   currentStopId = id;
   currentStopTab = 'days';
   expandedDays = new Set();
+  document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.remove('active'));
+  render();
+}
+
+function openDayPage(stopId, dayIndex) {
+  currentView = 'day';
+  currentStopId = stopId;
+  currentDayIndex = dayIndex;
   document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.remove('active'));
   render();
 }
@@ -556,9 +714,11 @@ function render() {
   if (currentView === 'dashboard') main.innerHTML = renderDashboard();
   else if (currentView === 'route') main.innerHTML = renderRoute();
   else if (currentView === 'stop') main.innerHTML = renderStopWorkspace();
+  else if (currentView === 'day') main.innerHTML = renderDayPage();
   else if (currentView === 'budget') main.innerHTML = renderBudget();
   else if (currentView === 'settings') main.innerHTML = renderSettings();
   attachHandlers();
+  if (currentView === 'day') attachDayPageMapHandler();
 }
 
 /* ---------- Dashboard ---------- */
@@ -596,59 +756,138 @@ function renderDashboard() {
     ...(data.bookings || []).map((b) => b.deadline)
   ].filter((d) => d && daysUntil(d) !== null && daysUntil(d) <= 14 && daysUntil(d) >= 0).length;
 
-  const chips = `
-    <div class="stat-chip ${toDeparture !== null && toDeparture < 0 ? 'warn' : ''}">
-      <div class="num">${toDeparture === null ? '—' : toDeparture}</div>
-      <div class="label">Days to departure</div>
-    </div>
-    <div class="stat-chip">
-      <div class="num">${stops.length}</div>
-      <div class="label">Stops planned</div>
-    </div>
-    <div class="stat-chip">
-      <div class="num">${totalDays}</div>
-      <div class="label">Total days routed</div>
-    </div>
-    <div class="stat-chip ${unscheduled ? 'warn' : ''}">
-      <div class="num">${unscheduled}</div>
-      <div class="label">Attractions to schedule</div>
-    </div>
-    <div class="stat-chip ${missingAccom ? 'danger' : ''}">
-      <div class="num">${missingAccom}</div>
-      <div class="label">Stops missing full stay coverage</div>
-    </div>
-    <div class="stat-chip ${calConflicts ? 'danger' : ''}">
-      <div class="num">${calConflicts}</div>
-      <div class="label">Shabbat/chag transport conflicts</div>
-    </div>
-    <div class="stat-chip ${stopsNeedingLocation ? 'warn' : ''}">
-      <div class="num">${stopsNeedingLocation}</div>
-      <div class="label">Stops needing location for Shabbat calc</div>
-    </div>
-    <div class="stat-chip ${upcomingDeadlines ? 'warn' : ''}">
-      <div class="num">${upcomingDeadlines}</div>
-      <div class="label">Booking deadlines within 14 days</div>
-    </div>
-  `;
-
-  const nextStops = stops.slice(0, 3);
-  const nextHtml = nextStops.length
-    ? nextStops.map((s) => `
-      <div class="card stop-card" data-open-stop="${s.id}">
-        <div class="stop-main">
-          <div class="country">${escapeHtml(s.country)}</div>
-          <div class="dates">${formatDate(s.startDate)} – ${formatDate(s.endDate)} · ${s.durationDays} days</div>
-        </div>
-        <div class="chevron">›</div>
-      </div>`).join('')
-    : `<div class="empty-state">No stops yet.<br><button class="btn btn-primary" data-goto="route">Add your first stop</button></div>`;
+  const today = todayIso();
+  const todayEntry = resolveRealDate(today);
+  const tomorrowEntry = resolveRealDate(addDays(today, 1));
+  const urgentItems = computeUrgentItems();
+  const workWidget = renderWorkWeekWidget();
 
   return `
+    ${!start ? `<div class="card" style="background:#fff7e6;border-color:var(--amber)">Set your trip start date in <b>Settings</b> to see Today/Tomorrow and urgent items here.</div>` : ''}
+
+    <div class="section-title">Today &amp; tomorrow</div>
+    ${renderTodayCard(todayEntry, 'Today')}
+    ${renderTodayCard(tomorrowEntry, 'Tomorrow')}
+
+    ${workWidget}
+
+    <div class="section-title">Needs attention (next 7 days)</div>
+    ${urgentItems.length
+      ? urgentItems.map((it) => `
+        <div class="card urgent-row ${it.severity}" data-jump-stop="${it.stopId || ''}" data-jump-tab="${it.tab || ''}" data-jump-budget="${it.jumpBudget ? '1' : ''}">
+          <span class="urgent-icon">${it.severity === 'high' ? '⚠' : 'ⓘ'}</span>
+          <span class="urgent-msg">${escapeHtml(it.message)}</span>
+          <span class="chevron">›</span>
+        </div>`).join('')
+      : `<div class="empty-state">Nothing urgent in the next 7 days.</div>`}
+
     <div class="section-title">Trip health</div>
-    <div class="stat-row">${chips}</div>
-    <div class="section-title">Next up</div>
-    ${nextHtml}
+    <div class="stat-row">
+      <div class="stat-chip ${toDeparture !== null && toDeparture < 0 ? 'warn' : ''}">
+        <div class="num">${toDeparture === null ? '—' : toDeparture}</div>
+        <div class="label">Days to departure</div>
+      </div>
+      <div class="stat-chip ${unscheduled ? 'warn' : ''}">
+        <div class="num">${unscheduled}</div>
+        <div class="label">Attractions to schedule</div>
+      </div>
+      <div class="stat-chip ${missingAccom ? 'danger' : ''}">
+        <div class="num">${missingAccom}</div>
+        <div class="label">Stops missing full stay coverage</div>
+      </div>
+      <div class="stat-chip ${calConflicts ? 'danger' : ''}">
+        <div class="num">${calConflicts}</div>
+        <div class="label">Shabbat/chag transport conflicts</div>
+      </div>
+      <div class="stat-chip ${stopsNeedingLocation ? 'warn' : ''}">
+        <div class="num">${stopsNeedingLocation}</div>
+        <div class="label">Stops needing location for Shabbat calc</div>
+      </div>
+      <div class="stat-chip ${upcomingDeadlines ? 'warn' : ''}">
+        <div class="num">${upcomingDeadlines}</div>
+        <div class="label">Booking deadlines within 14 days</div>
+      </div>
+    </div>
   `;
+}
+
+function renderTodayCard(entry, label) {
+  if (!entry) {
+    return `<div class="card"><div class="hint">${label}: outside your currently planned trip dates.</div></div>`;
+  }
+  const { stop, dayIndex, date } = entry;
+  const dayType = stop.dayTypes[dayIndex] || 'unset';
+  const dayTypeLabel = (DAY_TYPES.find((d) => d.value === dayType) || {}).label || 'Not set';
+  const scheduled = (stop.attractionBank || []).filter((a) => a.scheduledDay === dayIndex);
+  const accom = (stop.accommodations || []).find((a) => dayIndex >= a.startDayIndex && dayIndex < a.startDayIndex + a.nights);
+  return `
+    <div class="card today-card" data-open-day="${stop.id}" data-day="${dayIndex}">
+      <div class="today-card-head">
+        <span class="today-label">${label}</span>
+        <span class="today-country">${escapeHtml(stop.country)} · Day ${dayIndex + 1}</span>
+      </div>
+      <div class="hint">${formatDate(date)} · ${escapeHtml(dayTypeLabel)}</div>
+      ${accom ? `<div class="hint">🛏 ${escapeHtml(accom.name)}</div>` : '<div class="hint" style="color:var(--red)">No accommodation set</div>'}
+      <div class="hint">${scheduled.length ? scheduled.map((a) => escapeHtml(a.name)).join(', ') : 'Nothing scheduled yet'}</div>
+      <div class="chevron">›</div>
+    </div>
+  `;
+}
+
+function renderWorkWeekWidget() {
+  if (!getWorkDefaults().enabled) return '';
+  const ledger = buildWeeklyWorkLedger();
+  const thisWeekKey = sundayOfWeek(todayIso());
+  const thisWeek = ledger.weeks.find((w) => w.weekStart === thisWeekKey);
+  const balance = formatHoursBalance(ledger.cumulativeBalanceMinutes);
+  if (!thisWeek) return '';
+  const pct = thisWeek.targetMinutes ? Math.min(100, Math.round((thisWeek.creditedMinutes / thisWeek.targetMinutes) * 100)) : 0;
+  return `
+    <div class="section-title">Work hours this week</div>
+    <div class="card">
+      <div class="hint">${(thisWeek.creditedMinutes / 60).toFixed(1)}h of ${(thisWeek.targetMinutes / 60).toFixed(1)}h target</div>
+      <div class="budget-bar-track" style="margin-top:8px"><div class="budget-bar-fill ${pct >= 100 ? '' : 'over'}" style="width:${pct}%"></div></div>
+      <div class="hint balance-${balance.cls}" style="margin-top:8px">Running balance: ${balance.text}${balance.cls === 'owed' ? ' — carries forward until made up' : ''}</div>
+    </div>
+  `;
+}
+
+function computeUrgentItems() {
+  const items = [];
+  const start = todayIso();
+  const seenNoAccom = new Set();
+  for (let d = 0; d < 7; d++) {
+    const dateIso = addDays(start, d);
+    const entry = resolveRealDate(dateIso);
+    if (!entry) continue;
+    const { stop, dayIndex } = entry;
+    const accom = (stop.accommodations || []).find((a) => dayIndex >= a.startDayIndex && dayIndex < a.startDayIndex + a.nights);
+    if (!accom) {
+      const key = stop.id + ':' + dayIndex;
+      if (!seenNoAccom.has(key)) {
+        seenNoAccom.add(key);
+        items.push({ severity: 'high', message: `No accommodation for ${formatDate(dateIso)} — ${stop.country}, Day ${dayIndex + 1}`, stopId: stop.id, tab: 'stay' });
+      }
+    }
+    const dayType = stop.dayTypes[dayIndex] || 'unset';
+    const scheduled = (stop.attractionBank || []).filter((a) => a.scheduledDay === dayIndex);
+    if (!scheduled.length && !['travel', 'shabbat-holiday', 'buffer'].includes(dayType)) {
+      items.push({ severity: 'info', message: `Nothing planned for ${formatDate(dateIso)} — ${stop.country}, Day ${dayIndex + 1}`, stopId: stop.id, tab: 'days' });
+    }
+  }
+  (data.awardFlights || []).forEach((f) => {
+    const d = daysUntil(f.bookingDeadline);
+    if (d !== null && d >= 0 && d <= 7) {
+      items.push({ severity: 'high', message: `Award flight deadline in ${d}d: ${f.program} ${f.fromLabel} → ${f.toLabel}`, jumpBudget: true });
+    }
+  });
+  (data.bookings || []).forEach((b) => {
+    const d = daysUntil(b.deadline);
+    if (d !== null && d >= 0 && d <= 7) {
+      items.push({ severity: 'high', message: `Booking deadline in ${d}d: ${b.title}`, jumpBudget: true });
+    }
+  });
+  return items;
 }
 
 /* ---------- Route (country-level list) ---------- */
@@ -749,6 +988,25 @@ function renderStopWorkspace() {
 
 let expandedDays = new Set();
 
+function renderZmanimPanel(stop, flag) {
+  if (!flag.restricted) return '';
+  const settings = getShabbatSettings();
+  const bits = [];
+  if (flag.sunset) bits.push(`<div class="zman-row"><span class="zman-label">Sunset</span><span class="zman-time">${flag.sunset}</span></div>`);
+  if (flag.candleLighting) bits.push(`<div class="zman-row"><span class="zman-label">🕯 Candle lighting</span><span class="zman-time">${flag.candleLighting}</span></div>`);
+  if (flag.havdalah) bits.push(`<div class="zman-row"><span class="zman-label">✨ Ends (havdalah)</span><span class="zman-time">${flag.havdalah}</span></div>`);
+  if (bits.length) {
+    return `<div class="zmanim-panel">
+      ${flag.isChag ? `<div class="zman-chag">🕎 ${escapeHtml(flag.chagName || 'Chag')}</div>` : ''}
+      ${bits.join('')}
+      <div class="zman-method">${settings.candleLightingMins} min before sunset · ${escapeHtml(havdalahMethodLabel(settings.havdalahMethod))} · times local to ${escapeHtml(stop.countryInfo.timezone || stop.country)}</div>
+    </div>`;
+  } else if (hasLocation(stop)) {
+    return `<div class="zmanim-panel"><div class="hint-inline">Times unavailable for this date/latitude.</div></div>`;
+  }
+  return '';
+}
+
 function renderDaysTab(stop, withDates) {
   const calMap = computeShabbatChagMap(stop, withDates);
   const locationSet = hasLocation(stop);
@@ -768,24 +1026,7 @@ function renderDaysTab(stop, withDates) {
     const flag = getDayFlag(calMap, date);
     const isExpanded = expandedDays.has(i);
 
-    // Exact zmanim panel — the times themselves, not just "it's Shabbat"
-    let zmanimPanel = '';
-    if (flag.restricted) {
-      const settings = getShabbatSettings();
-      const bits = [];
-      if (flag.sunset) bits.push(`<div class="zman-row"><span class="zman-label">Sunset</span><span class="zman-time">${flag.sunset}</span></div>`);
-      if (flag.candleLighting) bits.push(`<div class="zman-row"><span class="zman-label">🕯 Candle lighting</span><span class="zman-time">${flag.candleLighting}</span></div>`);
-      if (flag.havdalah) bits.push(`<div class="zman-row"><span class="zman-label">✨ Ends (havdalah)</span><span class="zman-time">${flag.havdalah}</span></div>`);
-      if (bits.length) {
-        zmanimPanel = `<div class="zmanim-panel">
-          ${flag.isChag ? `<div class="zman-chag">🕎 ${escapeHtml(flag.chagName || 'Chag')}</div>` : ''}
-          ${bits.join('')}
-          <div class="zman-method">${settings.candleLightingMins} min before sunset · ${escapeHtml(havdalahMethodLabel(settings.havdalahMethod))} · times local to ${escapeHtml(stop.countryInfo.timezone || stop.country)}</div>
-        </div>`;
-      } else if (hasLocation(stop)) {
-        zmanimPanel = `<div class="zmanim-panel"><div class="hint-inline">Times unavailable for this date/latitude.</div></div>`;
-      }
-    }
+    const zmanimPanel = renderZmanimPanel(stop, flag);
 
     let flagBadges = '';
     if (flag.isFriday) flagBadges += `<span class="cal-badge shabbat">🕯 Shabbat begins${flag.candleLighting ? ' ' + flag.candleLighting : ''}</span>`;
@@ -796,6 +1037,24 @@ function renderDaysTab(stop, withDates) {
     const conflictHtml = conflicts.length
       ? `<div class="conflict-list">${conflicts.map((c) => `<div class="conflict-item ${c.severity}">${c.severity === 'high' ? '⚠' : 'ⓘ'} ${escapeHtml(c.message)}</div>`).join('')}</div>`
       : '';
+
+    // Work-hours mini panel — only shown if the global template is on
+    let workPanel = '';
+    if (getWorkDefaults().enabled) {
+      const skipped = !!(stop.workOverrides && stop.workOverrides[i]);
+      const wstats = computeDayWorkStats(stop, i, flag);
+      const restrictedNote = flag.restricted ? ' (Shabbat/chag — not counted)' : '';
+      workPanel = `
+        <div class="work-panel">
+          <label class="work-skip-row">
+            <input type="checkbox" data-action="toggle-work-skip" data-day="${i}" ${skipped ? 'checked' : ''} ${flag.restricted ? 'disabled' : ''} />
+            <span>Skip work target today</span>
+          </label>
+          ${wstats.targetMinutes > 0
+            ? `<div class="work-stat">💼 ${(wstats.creditedMinutes / 60).toFixed(1)}h / ${(wstats.targetMinutes / 60).toFixed(1)}h credited today</div>`
+            : `<div class="work-stat hint-inline">No work target today${restrictedNote}</div>`}
+        </div>`;
+    }
 
     rows.push(`
       <div class="card day-card ${flag.restricted ? 'day-restricted' : ''}">
@@ -811,6 +1070,7 @@ function renderDaysTab(stop, withDates) {
         ${flagBadges ? `<div class="cal-badges">${flagBadges}</div>` : ''}
         ${zmanimPanel}
         ${conflictHtml}
+        ${workPanel}
         <div class="day-accom">${accom ? '🛏 Sleeping: ' + escapeHtml(accom.name) : '<span class="hint-inline">No accommodation set for this night — add one in the Stay tab.</span>'}</div>
         <div class="day-activities">
           ${scheduled.length ? scheduled.map((a) => `
@@ -824,6 +1084,7 @@ function renderDaysTab(stop, withDates) {
 
         <button class="btn-expand-toggle" data-action="toggle-day-expand" data-day="${i}">${isExpanded ? '▾ Hide hour-by-hour schedule' : '▸ Hour-by-hour schedule'}</button>
         ${isExpanded ? renderDayScheduleSection(stop, i, flag) : ''}
+        <button class="btn-fullpage-link" data-action="open-day-page" data-stop="${stop.id}" data-day="${i}">⤢ Open as full page</button>
       </div>
     `);
   }
@@ -930,9 +1191,6 @@ const BLOCK_TYPE_CLASS = {
 function renderTimeline(stop, dayIndex, flag) {
   const blocks = (stop.daySchedule[dayIndex] || []).slice()
     .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
-  if (!blocks.length) {
-    return `<div class="hint-inline">No time blocks yet — add work, meals, sleep, travel, or attractions below.</div>`;
-  }
 
   const span = TIMELINE_END_MIN - TIMELINE_START_MIN;
   const toY = (mins) => ((Math.min(Math.max(mins, TIMELINE_START_MIN), TIMELINE_END_MIN) - TIMELINE_START_MIN) / span) * TIMELINE_HEIGHT;
@@ -957,6 +1215,21 @@ function renderTimeline(stop, dayIndex, flag) {
               <div class="tl-shabbat-line" style="top:${y}px"><span>✨ ${flag.havdalah}</span></div>`;
   }
 
+  // Virtual default work blocks — dashed, underneath. Never stored, always
+  // derived live from Settings, so editing the template updates every day.
+  const workEligible = isWorkEligibleDay(stop, dayIndex, flag);
+  let defaultEls = '';
+  if (workEligible) {
+    workDefaultIntervals().forEach((iv) => {
+      const top = toY(iv.start);
+      const height = Math.max(18, toY(iv.end) - top);
+      defaultEls += `
+        <div class="tl-default-block" style="top:${top}px;height:${height}px">
+          <span class="tl-default-label">Work (default) ${iv.startTime}–${iv.endTime}</span>
+        </div>`;
+    });
+  }
+
   const blockEls = blocks.map((b) => {
     const st = minutesFromTime(b.startTime);
     if (st === null) return '';
@@ -974,12 +1247,17 @@ function renderTimeline(stop, dayIndex, flag) {
       </div>`;
   }).join('');
 
+  const emptyHint = !blocks.length && !defaultEls
+    ? `<div class="hint-inline" style="margin-top:8px">No time blocks yet — add work, meals, sleep, travel, or attractions below.</div>` : '';
+
   return `
     <div class="timeline" style="height:${TIMELINE_HEIGHT}px">
       ${grid}
       ${shade}
+      ${defaultEls}
       ${blockEls}
     </div>
+    ${emptyHint}
     <div class="tl-legend">
       <span class="tl-key blk-work"></span>Work
       <span class="tl-key blk-meal"></span>Meal
@@ -992,6 +1270,123 @@ function renderTimeline(stop, dayIndex, flag) {
 }
 
 let dayViewMode = {}; // { [dayIndex]: 'timeline' | 'list' }
+
+/* ----- Full-page Day View ----- */
+
+function collectDayMapPoints(stop, dayIndex, accom) {
+  const points = [];
+  if (accom && accom.geoLat && accom.geoLon) points.push({ lat: accom.geoLat, lon: accom.geoLon, label: '🛏 ' + accom.name });
+  (stop.attractionBank || []).forEach((a) => {
+    if (a.scheduledDay === dayIndex && a.geoLat && a.geoLon) points.push({ lat: a.geoLat, lon: a.geoLon, label: '📍 ' + a.name });
+  });
+  return points;
+}
+
+function renderDayPage() {
+  const stop = stopById(currentStopId);
+  if (!stop || currentDayIndex === null) { setView('route'); return ''; }
+  const i = currentDayIndex;
+  const withDates = stopWithDatesById(currentStopId);
+  const date = withDates.startDate ? addDays(withDates.startDate, i) : '';
+  const calMap = computeShabbatChagMap(stop, withDates);
+  const flag = getDayFlag(calMap, date);
+  const dayType = stop.dayTypes[i] || 'unset';
+  const accom = (stop.accommodations || []).find((a) => i >= a.startDayIndex && i < a.startDayIndex + a.nights);
+  const scheduled = (stop.attractionBank || []).filter((a) => a.scheduledDay === i);
+  const conflicts = detectDayConflicts(stop, i, flag);
+  const zmanimPanel = renderZmanimPanel(stop, flag);
+
+  const workDefaultsOn = getWorkDefaults().enabled;
+  const skipped = !!(stop.workOverrides && stop.workOverrides[i]);
+  const wstats = computeDayWorkStats(stop, i, flag);
+
+  const mapPoints = collectDayMapPoints(stop, i, accom);
+  const prevDisabled = i <= 0;
+  const nextDisabled = i >= stop.durationDays - 1;
+
+  return `
+    <button class="btn-back" id="btn-back-to-stop">‹ ${escapeHtml(stop.country)}</button>
+    <div class="day-page-header">
+      <button class="day-nav-btn" id="day-prev" ${prevDisabled ? 'disabled style="opacity:.3"' : ''}>‹</button>
+      <div class="day-page-title">
+        <div class="day-num" style="font-size:1.25rem">Day ${i + 1} of ${stop.durationDays}</div>
+        <div class="dates">${date ? formatDate(date) : ''}</div>
+      </div>
+      <button class="day-nav-btn" id="day-next" ${nextDisabled ? 'disabled style="opacity:.3"' : ''}>›</button>
+    </div>
+
+    <select class="day-type-select" data-day="${i}" style="width:100%;margin-bottom:10px">
+      ${DAY_TYPES.map((dt) => `<option value="${dt.value}" ${dt.value === dayType ? 'selected' : ''}>${dt.label}</option>`).join('')}
+    </select>
+
+    ${zmanimPanel}
+    ${conflicts.length ? `<div class="conflict-list">${conflicts.map((c) => `<div class="conflict-item ${c.severity}">${c.severity === 'high' ? '⚠' : 'ⓘ'} ${escapeHtml(c.message)}</div>`).join('')}</div>` : ''}
+
+    ${workDefaultsOn ? `
+      <div class="work-panel">
+        <label class="work-skip-row">
+          <input type="checkbox" data-action="toggle-work-skip" data-day="${i}" ${skipped ? 'checked' : ''} ${flag.restricted ? 'disabled' : ''} />
+          <span>Skip work target today</span>
+        </label>
+        ${wstats.targetMinutes > 0
+          ? `<div class="work-stat">💼 ${(wstats.creditedMinutes / 60).toFixed(1)}h / ${(wstats.targetMinutes / 60).toFixed(1)}h credited today</div>`
+          : `<div class="work-stat hint-inline">No work target today</div>`}
+      </div>` : ''}
+
+    <div class="day-accom">${accom ? '🛏 Sleeping: ' + escapeHtml(accom.name) : '<span class="hint-inline">No accommodation set for this night — add one in the Stay tab.</span>'}</div>
+
+    <div class="section-title">Timeline</div>
+    ${renderDayScheduleSection(stop, i, flag)}
+
+    <div class="section-title">Attractions scheduled today</div>
+    <div class="day-activities">
+      ${scheduled.length ? scheduled.map((a) => `
+        <div class="activity-chip">
+          <span>${escapeHtml(a.name)}</span>
+          <button class="chip-x" data-action="unschedule" data-attr-id="${a.id}">✕</button>
+        </div>`).join('') : '<span class="hint-inline">Nothing scheduled yet.</span>'}
+    </div>
+    <button class="btn btn-secondary" data-action="add-activity-to-day" data-day="${i}">+ Add activity to this day</button>
+    <div id="day-activity-picker-${i}"></div>
+
+    ${mapPoints.length ? `
+      <div class="section-title">Today's map</div>
+      <div id="day-map-container" style="height:260px;border-radius:14px;overflow:hidden;border:1px solid var(--line);background:#eee"></div>
+      <div id="day-map-status" class="hint" style="margin-top:6px"></div>
+    ` : ''}
+  `;
+}
+
+function attachDayPageMapHandler() {
+  const stop = stopById(currentStopId);
+  if (!stop || currentDayIndex === null) return;
+  const backBtn = document.getElementById('btn-back-to-stop');
+  if (backBtn) backBtn.addEventListener('click', () => openStop(stop.id));
+  const prevBtn = document.getElementById('day-prev');
+  if (prevBtn) prevBtn.addEventListener('click', () => openDayPage(stop.id, currentDayIndex - 1));
+  const nextBtn = document.getElementById('day-next');
+  if (nextBtn) nextBtn.addEventListener('click', () => openDayPage(stop.id, currentDayIndex + 1));
+
+  // Reuse the same generic per-day handlers used inside the Stop workspace —
+  // they query by data-action/data-day and don't care which page they're on.
+  attachDaysHandlers(stop);
+
+  const mapDiv = document.getElementById('day-map-container');
+  if (!mapDiv) return;
+  const accom = (stop.accommodations || []).find((a) => currentDayIndex >= a.startDayIndex && currentDayIndex < a.startDayIndex + a.nights);
+  const points = collectDayMapPoints(stop, currentDayIndex, accom);
+  const status = document.getElementById('day-map-status');
+  const center = points.length
+    ? [points.reduce((s, p) => s + p.lat, 0) / points.length, points.reduce((s, p) => s + p.lon, 0) / points.length]
+    : null;
+  if (!center) return;
+  loadLeaflet().then(() => {
+    if (!document.getElementById('day-map-container')) return;
+    const map = window.L.map('day-map-container').setView(center, 12);
+    window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors', maxZoom: 19 }).addTo(map);
+    points.forEach((p) => window.L.marker([p.lat, p.lon]).addTo(map).bindPopup(p.label));
+  }).catch(() => { if (status) status.textContent = 'Could not load the map — needs an internet connection.'; });
+}
 
 function renderDayScheduleSection(stop, dayIndex, flag) {
   const mode = dayViewMode[dayIndex] || 'timeline';
@@ -2002,6 +2397,33 @@ function renderSettings() {
       <p class="hint" style="margin-top:10px">Calculations run entirely offline using the bundled Hebrew calendar. Sunset is astronomical for the stop's coordinates; candle lighting and havdalah follow the custom selected above. If your community follows a different practice, pick the closest option — and verify locally when it matters.</p>
     </div>
 
+    <div class="section-title">Work hours</div>
+    <div class="settings-block">
+      <h3>Daily default schedule</h3>
+      <p class="hint">Applies automatically to every day of the whole trip — you don't set this per stop. Friday, Saturday, and any chag are automatically excluded from the target. If a real activity overlaps a work block, the block isn't deleted — it's shown underneath, and the overlapped time still counts as owed, carried forward week to week until it's made up.</p>
+      <label class="hint" style="display:block;margin:8px 0 4px">
+        <input type="checkbox" id="work-enabled-toggle" ${getWorkDefaults().enabled ? 'checked' : ''} /> Use a daily work-hours template
+      </label>
+      <div id="work-defaults-fields" style="${getWorkDefaults().enabled ? '' : 'display:none'}">
+        <div class="form-row">
+          <div><label>Wake time</label><input type="time" id="work-wake" value="${escapeAttr(getWorkDefaults().wakeTime)}" /></div>
+          <div><label>Bedtime</label><input type="time" id="work-bedtime" value="${escapeAttr(getWorkDefaults().bedtime)}" /></div>
+        </div>
+        <label class="hint" style="display:block;margin:10px 0 4px">Work block 1</label>
+        <div class="form-row">
+          <div><input type="time" id="work-block1-start" value="${escapeAttr((getWorkDefaults().blocks[0] || {}).startTime || '')}" /></div>
+          <div><input type="time" id="work-block1-end" value="${escapeAttr((getWorkDefaults().blocks[0] || {}).endTime || '')}" /></div>
+        </div>
+        <label class="hint" style="display:block;margin:10px 0 4px">Work block 2</label>
+        <div class="form-row">
+          <div><input type="time" id="work-block2-start" value="${escapeAttr((getWorkDefaults().blocks[1] || {}).startTime || '')}" /></div>
+          <div><input type="time" id="work-block2-end" value="${escapeAttr((getWorkDefaults().blocks[1] || {}).endTime || '')}" /></div>
+        </div>
+        <button class="btn btn-secondary btn-block" id="btn-save-work-defaults" style="margin-top:10px">Save schedule</button>
+        <p class="hint" style="margin-top:8px">Current weekly target: <b>${(workDefaultIntervals().reduce((s, iv) => s + (iv.end - iv.start), 0) * 5 / 60).toFixed(1)}h</b> (2 blocks × 5 eligible days/week).</p>
+      </div>
+    </div>
+
     <div class="section-title">Travelers</div>
     <div class="settings-block">
       <h3>Who's on this trip</h3>
@@ -2043,6 +2465,14 @@ function mapsPinUrl(lat, lon) {
 function attachHandlers() {
   document.querySelectorAll('[data-goto]').forEach((b) => b.addEventListener('click', () => setView(b.dataset.goto)));
   document.querySelectorAll('[data-open-stop]').forEach((b) => b.addEventListener('click', () => openStop(b.dataset.openStop)));
+  document.querySelectorAll('[data-open-day]').forEach((b) => b.addEventListener('click', () => openDayPage(b.dataset.openDay, Number(b.dataset.day))));
+  document.querySelectorAll('[data-jump-stop], [data-jump-budget]').forEach((b) => b.addEventListener('click', () => {
+    if (b.dataset.jumpBudget) { setView('budget'); budgetSubTab = 'flights'; render(); return; }
+    if (b.dataset.jumpStop) {
+      openStop(b.dataset.jumpStop);
+      if (b.dataset.jumpTab) { currentStopTab = b.dataset.jumpTab; render(); }
+    }
+  }));
 
   if (currentView === 'route') attachRouteHandlers();
   if (currentView === 'stop') attachStopHandlers();
@@ -2156,6 +2586,18 @@ function attachDaysHandlers(stop) {
   document.querySelectorAll('[data-action="day-view-mode"]').forEach((b) => b.addEventListener('click', () => {
     dayViewMode[Number(b.dataset.day)] = b.dataset.mode;
     render();
+  }));
+
+  document.querySelectorAll('[data-action="toggle-work-skip"]').forEach((cb) => cb.addEventListener('click', () => {
+    const dayIndex = Number(cb.dataset.day);
+    if (!stop.workOverrides) stop.workOverrides = {};
+    stop.workOverrides[dayIndex] = cb.checked;
+    saveData();
+    render();
+  }));
+
+  document.querySelectorAll('[data-action="open-day-page"]').forEach((b) => b.addEventListener('click', () => {
+    openDayPage(b.dataset.stop, Number(b.dataset.day));
   }));
 
   document.querySelectorAll('[data-action="toggle-day-expand"]').forEach((b) => b.addEventListener('click', () => {
@@ -2508,6 +2950,30 @@ function attachSettingsHandlers() {
     toast('Havdalah custom updated — times recalculated.');
   });
 
+  const workEnabledToggle = document.getElementById('work-enabled-toggle');
+  if (workEnabledToggle) workEnabledToggle.addEventListener('change', (e) => {
+    data.meta.workDefaults.enabled = e.target.checked;
+    saveData();
+    render();
+  });
+
+  const saveWorkBtn = document.getElementById('btn-save-work-defaults');
+  if (saveWorkBtn) saveWorkBtn.addEventListener('click', () => {
+    data.meta.workDefaults.wakeTime = document.getElementById('work-wake').value || data.meta.workDefaults.wakeTime;
+    data.meta.workDefaults.bedtime = document.getElementById('work-bedtime').value || data.meta.workDefaults.bedtime;
+    const b1s = document.getElementById('work-block1-start').value;
+    const b1e = document.getElementById('work-block1-end').value;
+    const b2s = document.getElementById('work-block2-start').value;
+    const b2e = document.getElementById('work-block2-end').value;
+    const blocks = [];
+    if (b1s && b1e) blocks.push({ startTime: b1s, endTime: b1e });
+    if (b2s && b2e) blocks.push({ startTime: b2s, endTime: b2e });
+    data.meta.workDefaults.blocks = blocks;
+    saveData();
+    toast('Work schedule saved — applies to every day automatically.');
+    render();
+  });
+
   ['travelers-adults', 'travelers-children'].forEach((id) => {
     document.getElementById(id).addEventListener('change', () => {
       data.meta.travelers = {
@@ -2601,6 +3067,7 @@ function loadFromObject(parsed) {
   merged.meta = Object.assign({}, base.meta, parsed.meta || {});
   merged.meta.shabbatSettings = Object.assign({}, base.meta.shabbatSettings, (parsed.meta || {}).shabbatSettings || {});
   merged.meta.travelers = Object.assign({}, base.meta.travelers, (parsed.meta || {}).travelers || {});
+  merged.meta.workDefaults = Object.assign({}, base.meta.workDefaults, (parsed.meta || {}).workDefaults || {});
   merged.expenses = Array.isArray(parsed.expenses) ? parsed.expenses : [];
   merged.awardFlights = Array.isArray(parsed.awardFlights) ? parsed.awardFlights : [];
   merged.bookings = Array.isArray(parsed.bookings) ? parsed.bookings : [];
