@@ -1,6 +1,6 @@
 /* ---------- Data layer ---------- */
 
-const APP_VERSION = 'v6 · ' + '2026-07-27';
+const APP_VERSION = 'v7 · ' + '2026-07-27';
 const STORAGE_KEY = 'tripPlannerData_v1';
 
 const DAY_TYPES = [
@@ -18,6 +18,10 @@ const TRANSPORT_MODES = ['Flight', 'Train', 'Bus', 'Car rental', 'Taxi / ridesha
 const TRANSPORT_KINDS = ['Arrival', 'Local', 'Departure'];
 const GUIDED_OPTIONS = ['Not set', 'Guided tour recommended', 'Can visit independently', 'Either works'];
 const BLOCK_TYPES = ['Work', 'Meal', 'Sleep / rest', 'Travel', 'Attraction / excursion', 'Free time', 'Other'];
+const CONFIDENCE_LEVELS = ['Confirmed', 'Preliminary', 'Estimate', 'Assumption'];
+const BOOKING_STATUS = ['Researching', 'Shortlisted', 'Pending decision', 'Booked', 'Cancelled'];
+const BOOKING_CATEGORIES = ['Accommodation', 'Activity / tour', 'Visa', 'Insurance', 'Transport', 'Other'];
+
 const EXPENSE_CATEGORIES = [
   'Accommodation', 'Transportation', 'Flights', 'Food', 'Activities', 'Guides',
   'Insurance', 'Visas', 'Medical', 'Remote work', 'Child-related', 'Points & miles', 'Contingency', 'Other'
@@ -32,7 +36,9 @@ function defaultData() {
       fxRates: null // { base: 'USD', date: '...', rates: { PEN: 3.7, ... } }
     },
     stops: [],
-    expenses: [] // { id, category, stopId, description, amountLocal, currency, amountUSD, fxRateUsed, fxDate, date, notes }
+    expenses: [], // { id, category, stopId, description, amountLocal, currency, amountUSD, fxRateUsed, fxDate, date, notes }
+    awardFlights: [], // { id, program, fromLabel, toLabel, date, pointsPerPerson, taxesFees, passengers, transferPartner, transferBonus, cashEquivalent, confidence, dateChecked, source, bookingDeadline, status, notes }
+    bookings: [] // { id, title, category, deadline, status, notes, link }
   };
 }
 
@@ -318,6 +324,11 @@ function renderDashboard() {
     }
   });
 
+  const upcomingDeadlines = [
+    ...(data.awardFlights || []).map((f) => f.bookingDeadline),
+    ...(data.bookings || []).map((b) => b.deadline)
+  ].filter((d) => d && daysUntil(d) !== null && daysUntil(d) <= 14 && daysUntil(d) >= 0).length;
+
   const chips = `
     <div class="stat-chip ${toDeparture !== null && toDeparture < 0 ? 'warn' : ''}">
       <div class="num">${toDeparture === null ? '—' : toDeparture}</div>
@@ -346,6 +357,10 @@ function renderDashboard() {
     <div class="stat-chip ${stopsNeedingLocation ? 'warn' : ''}">
       <div class="num">${stopsNeedingLocation}</div>
       <div class="label">Stops needing location for Shabbat calc</div>
+    </div>
+    <div class="stat-chip ${upcomingDeadlines ? 'warn' : ''}">
+      <div class="num">${upcomingDeadlines}</div>
+      <div class="label">Booking deadlines within 14 days</div>
     </div>
   `;
 
@@ -1017,7 +1032,19 @@ function renderInfoTab(stop) {
 
 /* ---------- Budget page ---------- */
 
+let budgetSubTab = 'spending'; // spending | flights
+
 function renderBudget() {
+  const tabBar = `
+    <div class="stop-tabs">
+      <button class="stop-tab ${budgetSubTab === 'spending' ? 'active' : ''}" data-budget-tab="spending">Spending</button>
+      <button class="stop-tab ${budgetSubTab === 'flights' ? 'active' : ''}" data-budget-tab="flights">Flights &amp; bookings</button>
+    </div>
+  `;
+  return tabBar + (budgetSubTab === 'spending' ? renderBudgetSpending() : renderFlightsBookings());
+}
+
+function renderBudgetSpending() {
   const expenses = data.expenses || [];
   const totalUSD = expenses.reduce((sum, e) => sum + (Number(e.amountUSD) || 0), 0);
   const budget = data.meta.totalBudgetUSD;
@@ -1124,7 +1151,218 @@ function renderExpenseForm(stopOptionsHtml) {
   `;
 }
 
+/* ---------- Flights & bookings sub-page ---------- */
+
+function deadlineBadge(iso) {
+  if (!iso) return '';
+  const d = daysUntil(iso);
+  if (d < 0) return `<span class="deadline-badge expired">Deadline passed (${formatDate(iso)})</span>`;
+  if (d <= 14) return `<span class="deadline-badge soon">⏳ ${d} day${d === 1 ? '' : 's'} left</span>`;
+  return `<span class="deadline-badge">Due ${formatDate(iso)}</span>`;
+}
+
+function renderFlightsBookings() {
+  const flights = data.awardFlights || [];
+  const bookings = data.bookings || [];
+
+  const flightRows = flights.length ? [...flights].sort((a, b) => (a.bookingDeadline || '9999').localeCompare(b.bookingDeadline || '9999')).map((f) => `
+    <div class="card">
+      <div class="attr-main">
+        <div class="attr-name">${escapeHtml(f.program)} · ${escapeHtml(f.fromLabel)} → ${escapeHtml(f.toLabel)}</div>
+        <div class="hint">${f.pointsPerPerson ? f.pointsPerPerson + ' pts/person' : ''}${f.taxesFees ? ' + ' + f.taxesFees + ' fees' : ''}${f.passengers ? ' · ' + f.passengers + ' passengers' : ''}</div>
+        ${f.transferPartner ? `<div class="hint">Transfer: ${escapeHtml(f.transferPartner)}${f.transferBonus ? ' (' + escapeHtml(f.transferBonus) + ' bonus)' : ''}</div>` : ''}
+        ${f.cashEquivalent ? `<div class="hint">Cash equivalent: ${escapeHtml(f.cashEquivalent)}</div>` : ''}
+        <div class="attr-meta">
+          <span class="attr-tag">${escapeHtml(f.confidence)}</span>
+          <span class="attr-tag status-${(f.status || '').toLowerCase().replace(/\s+/g, '-')}">${escapeHtml(f.status)}</span>
+          ${deadlineBadge(f.bookingDeadline)}
+        </div>
+        ${f.dateChecked ? `<div class="hint">Checked ${formatDate(f.dateChecked)}${f.source ? ' · ' + escapeHtml(f.source) : ''}</div>` : ''}
+        ${f.notes ? `<div class="hint">${escapeHtml(f.notes)}</div>` : ''}
+      </div>
+      <button class="icon-btn" data-action="delete-flight" data-flight-id="${f.id}">✕</button>
+    </div>
+  `).join('') : `<div class="empty-state">No award flights tracked yet.</div>`;
+
+  const bookingRows = bookings.length ? [...bookings].sort((a, b) => (a.deadline || '9999').localeCompare(b.deadline || '9999')).map((b) => `
+    <div class="card">
+      <div class="attr-main">
+        <div class="attr-name">${escapeHtml(b.title)} <span class="hint">· ${b.category}</span></div>
+        <div class="attr-meta">
+          <span class="attr-tag status-${(b.status || '').toLowerCase().replace(/\s+/g, '-')}">${escapeHtml(b.status)}</span>
+          ${deadlineBadge(b.deadline)}
+        </div>
+        ${b.link ? `<a class="map-link" target="_blank" rel="noopener" href="${escapeAttr(b.link)}">Open link ↗</a>` : ''}
+        ${b.notes ? `<div class="hint">${escapeHtml(b.notes)}</div>` : ''}
+      </div>
+      <button class="icon-btn" data-action="delete-booking" data-booking-id="${b.id}">✕</button>
+    </div>
+  `).join('') : `<div class="empty-state">No bookings tracked yet.</div>`;
+
+  return `
+    <div class="section-title">Award flights</div>
+    <button class="btn btn-primary btn-block" id="btn-add-flight">+ Track an award flight</button>
+    <div id="flight-form-slot"></div>
+    ${flightRows}
+
+    <div class="section-title">Other bookings</div>
+    <p class="hint">Anything else with a deadline — a Pesach apartment hold, a visa appointment, a tour deposit.</p>
+    <button class="btn btn-primary btn-block" id="btn-add-booking">+ Add a booking</button>
+    <div id="booking-form-slot"></div>
+    ${bookingRows}
+  `;
+}
+
+function renderFlightForm() {
+  return `
+    <form class="inline-form" id="flight-form">
+      <label>Program (e.g. SAS, United, El Al via Qantas)</label>
+      <input name="program" required />
+      <div class="form-row">
+        <div><label>From</label><input name="fromLabel" placeholder="Tel Aviv" required /></div>
+        <div><label>To</label><input name="toLabel" placeholder="New York" required /></div>
+      </div>
+      <div class="form-row">
+        <div><label>Points per person</label><input name="pointsPerPerson" type="number" min="0" /></div>
+        <div><label>Taxes &amp; fees (total)</label><input name="taxesFees" placeholder="e.g. $72 x3" /></div>
+      </div>
+      <label>Passengers</label>
+      <input name="passengers" type="number" min="1" value="3" />
+      <div class="form-row">
+        <div><label>Transfer partner (optional)</label><input name="transferPartner" placeholder="e.g. Amex MR" /></div>
+        <div><label>Transfer bonus (optional)</label><input name="transferBonus" placeholder="e.g. 30%" /></div>
+      </div>
+      <label>Cash equivalent (optional)</label>
+      <input name="cashEquivalent" placeholder="e.g. $2,400 for 3" />
+      <label>Confidence</label>
+      <select name="confidence">${CONFIDENCE_LEVELS.map((c) => `<option value="${c}">${c}</option>`).join('')}</select>
+      <label>Status</label>
+      <select name="status">${BOOKING_STATUS.map((s) => `<option value="${s}">${s}</option>`).join('')}</select>
+      <div class="form-row">
+        <div><label>Date checked</label><input name="dateChecked" type="date" /></div>
+        <div><label>Booking deadline</label><input name="bookingDeadline" type="date" /></div>
+      </div>
+      <label>Source (optional)</label>
+      <input name="source" placeholder="e.g. pointsyeah.com search" />
+      <label>Notes</label>
+      <input name="notes" />
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Add</button>
+        <button type="button" class="btn btn-secondary" id="cancel-flight-form">Cancel</button>
+      </div>
+    </form>
+  `;
+}
+
+function renderBookingForm() {
+  return `
+    <form class="inline-form" id="booking-form">
+      <label>Title</label>
+      <input name="title" required placeholder="e.g. Pesach apartment hold" />
+      <label>Category</label>
+      <select name="category">${BOOKING_CATEGORIES.map((c) => `<option value="${c}">${c}</option>`).join('')}</select>
+      <label>Status</label>
+      <select name="status">${BOOKING_STATUS.map((s) => `<option value="${s}">${s}</option>`).join('')}</select>
+      <label>Deadline (optional)</label>
+      <input name="deadline" type="date" />
+      <label>Link (optional)</label>
+      <input name="link" placeholder="https://..." />
+      <label>Notes</label>
+      <input name="notes" />
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Add</button>
+        <button type="button" class="btn btn-secondary" id="cancel-booking-form">Cancel</button>
+      </div>
+    </form>
+  `;
+}
+
+function attachFlightsBookingsHandlers() {
+  const addFlightBtn = document.getElementById('btn-add-flight');
+  if (addFlightBtn) addFlightBtn.addEventListener('click', () => {
+    document.getElementById('flight-form-slot').innerHTML = renderFlightForm();
+    const form = document.getElementById('flight-form');
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      data.awardFlights.push({
+        id: uid('flight'),
+        program: fd.get('program').trim(),
+        fromLabel: fd.get('fromLabel').trim(),
+        toLabel: fd.get('toLabel').trim(),
+        pointsPerPerson: fd.get('pointsPerPerson') || '',
+        taxesFees: (fd.get('taxesFees') || '').trim(),
+        passengers: fd.get('passengers') || '',
+        transferPartner: (fd.get('transferPartner') || '').trim(),
+        transferBonus: (fd.get('transferBonus') || '').trim(),
+        cashEquivalent: (fd.get('cashEquivalent') || '').trim(),
+        confidence: fd.get('confidence'),
+        status: fd.get('status'),
+        dateChecked: fd.get('dateChecked') || '',
+        bookingDeadline: fd.get('bookingDeadline') || '',
+        source: (fd.get('source') || '').trim(),
+        notes: (fd.get('notes') || '').trim()
+      });
+      saveData();
+      toast('Award flight tracked.');
+      render();
+    });
+    document.getElementById('cancel-flight-form').addEventListener('click', () => {
+      document.getElementById('flight-form-slot').innerHTML = '';
+    });
+  });
+
+  document.querySelectorAll('[data-action="delete-flight"]').forEach((b) => b.addEventListener('click', () => {
+    if (!confirm('Remove this tracked flight?')) return;
+    data.awardFlights = data.awardFlights.filter((f) => f.id !== b.dataset.flightId);
+    saveData();
+    render();
+  }));
+
+  const addBookingBtn = document.getElementById('btn-add-booking');
+  if (addBookingBtn) addBookingBtn.addEventListener('click', () => {
+    document.getElementById('booking-form-slot').innerHTML = renderBookingForm();
+    const form = document.getElementById('booking-form');
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      data.bookings.push({
+        id: uid('booking'),
+        title: fd.get('title').trim(),
+        category: fd.get('category'),
+        status: fd.get('status'),
+        deadline: fd.get('deadline') || '',
+        link: (fd.get('link') || '').trim(),
+        notes: (fd.get('notes') || '').trim()
+      });
+      saveData();
+      toast('Booking added.');
+      render();
+    });
+    document.getElementById('cancel-booking-form').addEventListener('click', () => {
+      document.getElementById('booking-form-slot').innerHTML = '';
+    });
+  });
+
+  document.querySelectorAll('[data-action="delete-booking"]').forEach((b) => b.addEventListener('click', () => {
+    if (!confirm('Remove this booking?')) return;
+    data.bookings = data.bookings.filter((bk) => bk.id !== b.dataset.bookingId);
+    saveData();
+    render();
+  }));
+}
+
 function attachBudgetHandlers() {
+  document.querySelectorAll('[data-budget-tab]').forEach((b) => b.addEventListener('click', () => {
+    budgetSubTab = b.dataset.budgetTab;
+    render();
+  }));
+
+  if (budgetSubTab === 'flights') {
+    attachFlightsBookingsHandlers();
+    return;
+  }
+
   document.getElementById('total-budget-input').addEventListener('change', (e) => {
     const v = parseFloat(e.target.value);
     data.meta.totalBudgetUSD = isNaN(v) ? null : v;
@@ -1691,6 +1929,8 @@ function loadFromObject(parsed) {
   const merged = Object.assign({}, base, parsed);
   merged.meta = Object.assign({}, base.meta, parsed.meta || {});
   merged.expenses = Array.isArray(parsed.expenses) ? parsed.expenses : [];
+  merged.awardFlights = Array.isArray(parsed.awardFlights) ? parsed.awardFlights : [];
+  merged.bookings = Array.isArray(parsed.bookings) ? parsed.bookings : [];
   merged.stops = (parsed.stops || []).map((s) => {
     const stop = Object.assign(defaultStop(), s);
     stop.countryInfo = Object.assign({}, defaultStop().countryInfo, s.countryInfo || {});

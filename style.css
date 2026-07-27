@@ -53,6 +53,13 @@ header.topbar .brand small {
   margin-top: 2px;
 }
 
+.version-badge {
+  font-size: 0.68rem;
+  opacity: 0.7;
+  white-space: nowrap;
+  padding-left: 8px;
+}
+
 main {
   padding: 18px 16px 8px;
   max-width: 640px;
@@ -592,3 +599,30 @@ textarea {
   color: var(--sage);
   font-weight: 600;
 }
+
+/* ---- Stage 7: award flights & bookings ---- */
+
+.deadline-badge {
+  font-size: 0.72rem;
+  background: var(--sand);
+  color: var(--teal-dark);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-weight: 600;
+}
+
+.deadline-badge.soon {
+  background: #fdecc8;
+  color: var(--amber);
+}
+
+.deadline-badge.expired {
+  background: #f4e2dd;
+  color: var(--red);
+}
+
+.attr-tag.status-researching { background: var(--sand); color: var(--teal-dark); }
+.attr-tag.status-shortlisted { background: #dcecea; color: var(--teal-dark); }
+.attr-tag.status-pending-decision { background: #fdecc8; color: var(--amber); }
+.attr-tag.status-booked { background: #d9efe4; color: var(--sage); }
+.attr-tag.status-cancelled { background: #f4e2dd; color: var(--red); }
