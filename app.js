@@ -1,5 +1,6 @@
 /* ---------- Data layer ---------- */
 
+const APP_VERSION = 'v6 · ' + '2026-07-27';
 const STORAGE_KEY = 'tripPlannerData_v1';
 
 const DAY_TYPES = [
@@ -1196,6 +1197,12 @@ function renderSettings() {
       <p class="hint">This replaces everything currently in the app with what's in the file.</p>
       <input type="file" id="import-file" accept="application/json" />
     </div>
+    <div class="section-title">App version</div>
+    <div class="settings-block">
+      <h3>Currently running: ${APP_VERSION}</h3>
+      <p class="hint">If you've uploaded an update and the app still looks old after reopening it, use this to force a completely clean reload. It clears the app's offline cache and re-downloads everything — your trip data is untouched, since that's stored separately.</p>
+      <button class="btn btn-secondary btn-block" id="btn-force-refresh">Force refresh app</button>
+    </div>
   `;
 }
 
@@ -1620,6 +1627,24 @@ function attachSettingsHandlers() {
   });
   document.getElementById('btn-export').addEventListener('click', exportData);
   document.getElementById('import-file').addEventListener('change', importData);
+
+  document.getElementById('btn-force-refresh').addEventListener('click', async () => {
+    toast('Clearing cache and reloading…');
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+      }
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+    } catch (e) {
+      console.warn('Force refresh cleanup had an issue, reloading anyway.', e);
+    }
+    // cache-busting query param forces the browser to bypass any remaining HTTP cache too
+    window.location.href = window.location.pathname + '?refreshed=' + Date.now();
+  });
 }
 
 /* ---------- Export / Import ---------- */
@@ -1685,6 +1710,8 @@ function escapeAttr(str) { return escapeHtml(str); }
 /* ---------- Init ---------- */
 
 document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
+const versionBadge = document.getElementById('version-badge');
+if (versionBadge) versionBadge.textContent = APP_VERSION;
 render();
 
 if (!data.meta.fxRates) {
@@ -1701,8 +1728,15 @@ if ('serviceWorker' in navigator) {
     window.location.reload();
   });
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js').then((reg) => {
+    // updateViaCache: 'none' stops the browser from serving a stale, HTTP-cached
+    // copy of sw.js itself — this was likely the real cause of updates not sticking.
+    navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).then((reg) => {
       reg.update();
+      // Re-check for updates whenever the app comes back to the foreground,
+      // since a backgrounded/installed app doesn't always re-check on its own.
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') reg.update();
+      });
     }).catch((err) => console.warn('SW registration failed', err));
   });
 }
