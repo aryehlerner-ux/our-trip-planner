@@ -16,6 +16,7 @@ const DAY_TYPES = [
 const TRANSPORT_MODES = ['Flight', 'Train', 'Bus', 'Car rental', 'Taxi / rideshare', 'Private driver', 'Public transit', 'Ferry', 'Other'];
 const TRANSPORT_KINDS = ['Arrival', 'Local', 'Departure'];
 const GUIDED_OPTIONS = ['Not set', 'Guided tour recommended', 'Can visit independently', 'Either works'];
+const BLOCK_TYPES = ['Work', 'Meal', 'Sleep / rest', 'Travel', 'Attraction / excursion', 'Free time', 'Other'];
 const EXPENSE_CATEGORIES = [
   'Accommodation', 'Transportation', 'Flights', 'Food', 'Activities', 'Guides',
   'Insurance', 'Visas', 'Medical', 'Remote work', 'Child-related', 'Points & miles', 'Contingency', 'Other'
@@ -37,7 +38,8 @@ function defaultData() {
 function defaultAttraction() {
   return {
     id: '', name: '', description: '', location: '', guidedOrSelf: 'Not set',
-    gettingThere: '', whatToBring: '', notes: '', tags: [], source: 'manual', scheduledDay: null
+    gettingThere: '', whatToBring: '', notes: '', tags: [], source: 'manual', scheduledDay: null,
+    geoLat: null, geoLon: null
   };
 }
 
@@ -45,6 +47,7 @@ function defaultStop() {
   return {
     id: '', country: '', durationDays: 14, notes: '',
     dayTypes: {},
+    daySchedule: {}, // { [dayIndex]: [ { id, type, label, startTime, endTime, attractionId, notes } ] }
     attractionBank: [],
     accommodations: [],
     transport: [],
@@ -213,8 +216,34 @@ function openStop(id) {
   currentView = 'stop';
   currentStopId = id;
   currentStopTab = 'days';
+  expandedDays = new Set();
   document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.remove('active'));
   render();
+}
+
+/* ---------- Live location lookup (free, no API key) ---------- */
+// Uses OpenStreetMap's Nominatim search — free and keyless, but rate-limited,
+// so this only runs when you tap "Find exact location," not automatically on
+// every keystroke. Result is cached on the record so it's a one-time lookup.
+
+async function geocodeLocation(query) {
+  try {
+    const resp = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(query));
+    const json = await resp.json();
+    if (json && json[0]) {
+      return { lat: parseFloat(json[0].lat), lon: parseFloat(json[0].lon), displayName: json[0].display_name };
+    }
+  } catch (e) {
+    console.error('Location lookup failed (offline?)', e);
+  }
+  return null;
+}
+
+function googleFlightsSearchUrl(detail) {
+  return 'https://www.google.com/travel/flights?q=' + encodeURIComponent(detail || 'flights');
+}
+function webSearchUrl(query) {
+  return 'https://www.google.com/search?q=' + encodeURIComponent(query);
 }
 
 /* ---------- Budget / currency ---------- */
@@ -403,6 +432,7 @@ function renderStopWorkspace() {
     { key: 'attractions', label: 'Attractions' },
     { key: 'stay', label: 'Stay' },
     { key: 'transport', label: 'Transport' },
+    { key: 'map', label: 'Map' },
     { key: 'info', label: 'Country info' }
   ];
 
@@ -417,6 +447,7 @@ function renderStopWorkspace() {
   else if (currentStopTab === 'attractions') body = renderAttractionsTab(stop);
   else if (currentStopTab === 'stay') body = renderStayTab(stop, withDates);
   else if (currentStopTab === 'transport') body = renderTransportTab(stop);
+  else if (currentStopTab === 'map') body = renderMapTab(stop);
   else if (currentStopTab === 'info') body = renderInfoTab(stop);
 
   return `
@@ -432,6 +463,8 @@ function renderStopWorkspace() {
 }
 
 /* ----- Days tab ----- */
+
+let expandedDays = new Set();
 
 function renderDaysTab(stop, withDates) {
   const calMap = computeShabbatChagMap(stop, withDates);
@@ -450,6 +483,7 @@ function renderDaysTab(stop, withDates) {
     const scheduled = (stop.attractionBank || []).filter((a) => a.scheduledDay === i);
     const accom = (stop.accommodations || []).find((a) => i >= a.startDayIndex && i < a.startDayIndex + a.nights);
     const flag = getDayFlag(calMap, date);
+    const isExpanded = expandedDays.has(i);
 
     let flagBadges = '';
     if (flag.isFriday) flagBadges += `<span class="cal-badge shabbat">🕯 Shabbat begins${flag.candleLighting ? ' ' + flag.candleLighting : ''}</span>`;
@@ -478,10 +512,68 @@ function renderDaysTab(stop, withDates) {
         </div>
         <button class="btn btn-secondary" data-action="add-activity-to-day" data-day="${i}">+ Add activity to this day</button>
         <div id="day-activity-picker-${i}"></div>
+
+        <button class="btn-expand-toggle" data-action="toggle-day-expand" data-day="${i}">${isExpanded ? '▾ Hide hour-by-hour schedule' : '▸ Hour-by-hour schedule'}</button>
+        ${isExpanded ? renderDayScheduleSection(stop, i) : ''}
       </div>
     `);
   }
   return rows.join('');
+}
+
+function renderDayScheduleSection(stop, dayIndex) {
+  const blocks = (stop.daySchedule[dayIndex] || []).slice().sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
+  const rows = blocks.length ? blocks.map((b) => `
+    <div class="sched-row">
+      <div class="sched-time">${b.startTime || '?'}${b.endTime ? '–' + b.endTime : ''}</div>
+      <div class="sched-label"><span class="sched-type">${escapeHtml(b.type)}</span>${b.label ? ' · ' + escapeHtml(b.label) : ''}${b.notes ? ' · ' + escapeHtml(b.notes) : ''}</div>
+      <button class="icon-btn" data-action="delete-block" data-day="${dayIndex}" data-block-id="${b.id}">✕</button>
+    </div>
+  `).join('') : '<div class="hint-inline">No time blocks yet — add work, meals, sleep, travel, or attractions below.</div>';
+
+  return `
+    <div class="day-schedule">
+      ${rows}
+      <button class="btn btn-secondary" data-action="add-block" data-day="${dayIndex}" style="margin-top:8px">+ Add time block</button>
+      <div id="block-form-slot-${dayIndex}"></div>
+    </div>
+  `;
+}
+
+function renderBlockForm(stop, dayIndex) {
+  const scheduledAttractions = (stop.attractionBank || []).filter((a) => a.scheduledDay === dayIndex);
+  return `
+    <form class="inline-form" id="block-form-${dayIndex}">
+      <label>Type</label>
+      <select name="type">${BLOCK_TYPES.map((t) => `<option value="${t}">${t}</option>`).join('')}</select>
+      <div class="form-row">
+        <div><label>Start time</label><input type="time" name="startTime" required /></div>
+        <div><label>End time</label><input type="time" name="endTime" /></div>
+      </div>
+      ${scheduledAttractions.length ? `
+        <label>Link to a scheduled attraction (optional)</label>
+        <select name="attractionId">
+          <option value="">— none —</option>
+          ${scheduledAttractions.map((a) => `<option value="${a.id}">${escapeHtml(a.name)}</option>`).join('')}
+        </select>
+      ` : ''}
+      <label>Label</label>
+      <input name="label" placeholder="e.g. Breakfast, Work block, Rainbow Mountain hike" />
+      <label>Notes</label>
+      <input name="notes" />
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Add</button>
+        <button type="button" class="btn btn-secondary" data-action="cancel-block-form" data-day="${dayIndex}">Cancel</button>
+      </div>
+    </form>
+  `;
+}
+
+function timesOverlap(s1, e1, s2, e2) {
+  if (!s1 || !s2) return false;
+  const end1 = e1 || s1;
+  const end2 = e2 || s2;
+  return s1 < end2 && s2 < end1;
 }
 
 function renderActivityPicker(stop, dayIndex) {
@@ -515,7 +607,12 @@ function renderAttractionsTab(stop) {
         <div class="attr-name">${escapeHtml(a.name)}</div>
         ${a.description ? `<div class="hint">${escapeHtml(a.description)}</div>` : ''}
         <div class="attr-meta">
-          ${a.location ? `<a class="map-link" target="_blank" rel="noopener" href="${mapsSearchUrl(a.location + ', ' + stop.country)}">📍 ${escapeHtml(a.location)} ↗</a>` : ''}
+          ${a.location ? `
+            <span class="loc-row">
+              <a class="map-link" target="_blank" rel="noopener" href="${a.geoLat ? mapsPinUrl(a.geoLat, a.geoLon) : mapsSearchUrl(a.location + ', ' + stop.country)}">📍 ${escapeHtml(a.location)} ↗</a>
+              ${a.geoLat ? '<span class="geo-badge">located</span>' : `<button class="icon-btn" data-action="geocode-attraction" data-attr-id="${a.id}">🔎</button>`}
+            </span>
+          ` : ''}
           ${a.guidedOrSelf && a.guidedOrSelf !== 'Not set' ? `<span class="attr-tag">${escapeHtml(a.guidedOrSelf)}</span>` : ''}
         </div>
         ${a.gettingThere ? `<div class="hint">🚗 ${escapeHtml(a.gettingThere)}</div>` : ''}
@@ -664,7 +761,12 @@ function renderStayTab(stop, withDates) {
       <div class="attr-main">
         <div class="attr-name">${escapeHtml(a.name)}</div>
         <div class="hint">Day ${a.startDayIndex + 1}–${a.startDayIndex + a.nights} · ${a.nights} night${a.nights === 1 ? '' : 's'}${a.cost ? ' · ' + a.cost + ' ' + escapeHtml(a.currency || '') : ''}</div>
-        ${a.address ? `<a class="map-link" target="_blank" rel="noopener" href="${mapsSearchUrl(a.address)}">${escapeHtml(a.address)} ↗</a>` : ''}
+        ${a.address ? `
+          <div class="loc-row">
+            <a class="map-link" target="_blank" rel="noopener" href="${a.geoLat ? mapsPinUrl(a.geoLat, a.geoLon) : mapsSearchUrl(a.address)}">${escapeHtml(a.address)} ↗</a>
+            ${a.geoLat ? '<span class="geo-badge">📍 located</span>' : `<button class="icon-btn" data-action="geocode-accom" data-accom-id="${a.id}">🔎</button>`}
+          </div>
+        ` : ''}
         ${a.confirmation ? `<div class="hint">Confirmation: ${escapeHtml(a.confirmation)}</div>` : ''}
         ${a.notes ? `<div class="hint">${escapeHtml(a.notes)}</div>` : ''}
       </div>
@@ -735,6 +837,7 @@ function renderTransportTab(stop) {
         warning = `<div class="cal-warning">⚠ This falls on ${escapeHtml(reason)} — avoid travel on this day.</div>`;
       }
     }
+    const searchUrl = t.mode === 'Flight' ? googleFlightsSearchUrl(t.detail) : webSearchUrl((t.detail || t.mode) + ' ' + stop.country);
     return `
     <div class="card">
       <div class="attr-main">
@@ -743,6 +846,7 @@ function renderTransportTab(stop) {
         ${warning}
         ${t.confirmation ? `<div class="hint">Confirmation: ${escapeHtml(t.confirmation)}</div>` : ''}
         ${t.notes ? `<div class="hint">${escapeHtml(t.notes)}</div>` : ''}
+        <a class="map-link" target="_blank" rel="noopener" href="${searchUrl}">${t.mode === 'Flight' ? 'Search flights ↗' : 'Search online ↗'}</a>
       </div>
       <button class="icon-btn" data-action="delete-transport" data-transport-id="${t.id}">✕</button>
     </div>
@@ -788,6 +892,78 @@ function renderTransportForm(stop) {
       </div>
     </form>
   `;
+}
+
+/* ----- Map tab (free, keyless — OpenStreetMap via Leaflet, loaded from CDN) ----- */
+
+function collectMapPoints(stop) {
+  const points = [];
+  (stop.accommodations || []).forEach((a) => {
+    if (a.geoLat && a.geoLon) points.push({ lat: a.geoLat, lon: a.geoLon, label: '🛏 ' + a.name, kind: 'accom' });
+  });
+  (stop.attractionBank || []).forEach((a) => {
+    if (a.geoLat && a.geoLon) points.push({ lat: a.geoLat, lon: a.geoLon, label: '📍 ' + a.name, kind: 'attraction' });
+  });
+  return points;
+}
+
+function renderMapTab(stop) {
+  const points = collectMapPoints(stop);
+  const missingCount = (stop.accommodations || []).filter((a) => a.address && !a.geoLat).length
+    + (stop.attractionBank || []).filter((a) => a.location && !a.geoLat).length;
+  return `
+    <p class="hint">Pins come from accommodations and attractions you've looked up with the 🔎 "find exact location" button on their tabs — this map loads live map tiles, so it needs an internet connection.</p>
+    ${missingCount ? `<p class="hint">${missingCount} location${missingCount === 1 ? '' : 's'} not yet looked up — visit Stay or Attractions and tap 🔎 next to the address to add them here.</p>` : ''}
+    <div id="stop-map-container" style="height:340px;border-radius:14px;overflow:hidden;border:1px solid var(--line);background:#eee"></div>
+    <div id="map-status" class="hint" style="margin-top:8px"></div>
+  `;
+}
+
+let leafletLoadPromise = null;
+function loadLeaflet() {
+  if (window.L) return Promise.resolve();
+  if (leafletLoadPromise) return leafletLoadPromise;
+  leafletLoadPromise = new Promise((resolve, reject) => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    document.head.appendChild(link);
+    const script = document.createElement('script');
+    script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error('offline-or-blocked'));
+    document.body.appendChild(script);
+  });
+  return leafletLoadPromise;
+}
+
+function initStopMap(stop) {
+  const container = document.getElementById('stop-map-container');
+  const status = document.getElementById('map-status');
+  if (!container) return;
+
+  const points = collectMapPoints(stop);
+  const info = stop.countryInfo || {};
+  let center = points.length
+    ? [points.reduce((s, p) => s + p.lat, 0) / points.length, points.reduce((s, p) => s + p.lon, 0) / points.length]
+    : (info.lat && info.lon ? [parseFloat(info.lat), parseFloat(info.lon)] : null);
+
+  if (!center) {
+    status.textContent = 'Add coordinates in Country Info, or look up an accommodation/attraction location, to show a map here.';
+    return;
+  }
+
+  loadLeaflet().then(() => {
+    if (!document.getElementById('stop-map-container')) return; // tab changed while loading
+    const map = window.L.map('stop-map-container').setView(center, points.length ? 11 : 8);
+    window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors', maxZoom: 19
+    }).addTo(map);
+    points.forEach((p) => window.L.marker([p.lat, p.lon]).addTo(map).bindPopup(p.label));
+    if (!points.length) status.textContent = 'Showing the stop\'s general area — look up specific accommodations/attractions to pin them here.';
+  }).catch(() => {
+    status.textContent = 'Could not load the map — this needs an internet connection.';
+  });
 }
 
 /* ----- Country info tab ----- */
@@ -1029,6 +1205,10 @@ function mapsSearchUrl(query) {
   return 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(query);
 }
 
+function mapsPinUrl(lat, lon) {
+  return 'https://www.google.com/maps/search/?api=1&query=' + lat + ',' + lon;
+}
+
 /* ---------- Handlers ---------- */
 
 function attachHandlers() {
@@ -1120,6 +1300,7 @@ function attachStopHandlers() {
   else if (currentStopTab === 'attractions') attachAttractionsHandlers(stop);
   else if (currentStopTab === 'stay') attachStayHandlers(stop);
   else if (currentStopTab === 'transport') attachTransportHandlers(stop);
+  else if (currentStopTab === 'map') initStopMap(stop);
   else if (currentStopTab === 'info') attachInfoHandlers(stop);
 }
 
@@ -1141,6 +1322,55 @@ function attachDaysHandlers(stop) {
     slot.innerHTML = renderActivityPicker(stop, dayIndex);
     wireActivityPicker(stop, dayIndex);
   }));
+
+  document.querySelectorAll('[data-action="toggle-day-expand"]').forEach((b) => b.addEventListener('click', () => {
+    const dayIndex = Number(b.dataset.day);
+    if (expandedDays.has(dayIndex)) expandedDays.delete(dayIndex); else expandedDays.add(dayIndex);
+    render();
+  }));
+
+  document.querySelectorAll('[data-action="add-block"]').forEach((b) => b.addEventListener('click', () => {
+    const dayIndex = Number(b.dataset.day);
+    document.getElementById('block-form-slot-' + dayIndex).innerHTML = renderBlockForm(stop, dayIndex);
+    wireBlockForm(stop, dayIndex);
+  }));
+
+  document.querySelectorAll('[data-action="delete-block"]').forEach((b) => b.addEventListener('click', () => {
+    const dayIndex = Number(b.dataset.day);
+    stop.daySchedule[dayIndex] = (stop.daySchedule[dayIndex] || []).filter((blk) => blk.id !== b.dataset.blockId);
+    saveData();
+    render();
+  }));
+}
+
+function wireBlockForm(stop, dayIndex) {
+  const form = document.getElementById('block-form-' + dayIndex);
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const startTime = fd.get('startTime');
+    const endTime = fd.get('endTime') || '';
+    const attractionId = fd.get('attractionId') || null;
+    let label = (fd.get('label') || '').trim();
+    if (!label && attractionId) {
+      const a = stop.attractionBank.find((x) => x.id === attractionId);
+      if (a) label = a.name;
+    }
+    const existingBlocks = stop.daySchedule[dayIndex] || [];
+    const overlap = existingBlocks.some((blk) => timesOverlap(startTime, endTime, blk.startTime, blk.endTime));
+
+    if (!stop.daySchedule[dayIndex]) stop.daySchedule[dayIndex] = [];
+    stop.daySchedule[dayIndex].push({
+      id: uid('block'), type: fd.get('type'), label, startTime, endTime,
+      attractionId, notes: (fd.get('notes') || '').trim()
+    });
+    saveData();
+    toast(overlap ? 'Added — heads up, this overlaps another block on this day.' : 'Time block added.');
+    render();
+  });
+  document.querySelector(`[data-action="cancel-block-form"][data-day="${dayIndex}"]`).addEventListener('click', () => {
+    document.getElementById('block-form-slot-' + dayIndex).innerHTML = '';
+  });
 }
 
 function wireActivityPicker(stop, dayIndex) {
@@ -1183,6 +1413,22 @@ function attachAttractionsHandlers(stop) {
     stop.attractionBank = stop.attractionBank.filter((a) => a.id !== b.dataset.attrId);
     saveData();
     render();
+  }));
+
+  document.querySelectorAll('[data-action="geocode-attraction"]').forEach((b) => b.addEventListener('click', async () => {
+    const attr = stop.attractionBank.find((a) => a.id === b.dataset.attrId);
+    if (!attr) return;
+    toast('Looking up location…');
+    const result = await geocodeLocation(attr.location + ', ' + stop.country);
+    if (result) {
+      attr.geoLat = result.lat;
+      attr.geoLon = result.lon;
+      saveData();
+      toast('Location found.');
+      render();
+    } else {
+      toast('Could not find that location — check the spelling, or you may be offline.');
+    }
   }));
 
   const promptBtn = document.getElementById('btn-build-ai-prompt');
@@ -1266,7 +1512,8 @@ function attachStayHandlers(stop) {
         cost: fd.get('cost') || '',
         currency: (fd.get('currency') || '').trim(),
         confirmation: (fd.get('confirmation') || '').trim(),
-        notes: (fd.get('notes') || '').trim()
+        notes: (fd.get('notes') || '').trim(),
+        geoLat: null, geoLon: null
       });
       saveData();
       render();
@@ -1280,6 +1527,22 @@ function attachStayHandlers(stop) {
     stop.accommodations = stop.accommodations.filter((a) => a.id !== b.dataset.accomId);
     saveData();
     render();
+  }));
+
+  document.querySelectorAll('[data-action="geocode-accom"]').forEach((b) => b.addEventListener('click', async () => {
+    const accom = stop.accommodations.find((a) => a.id === b.dataset.accomId);
+    if (!accom) return;
+    toast('Looking up location…');
+    const result = await geocodeLocation(accom.address + ', ' + stop.country);
+    if (result) {
+      accom.geoLat = result.lat;
+      accom.geoLon = result.lon;
+      saveData();
+      toast('Location found.');
+      render();
+    } else {
+      toast('Could not find that location — check the address, or you may be offline.');
+    }
   }));
 }
 
@@ -1429,7 +1692,17 @@ if (!data.meta.fxRates) {
 }
 
 if ('serviceWorker' in navigator) {
+  // Fixes "update doesn't apply": when a new service worker takes over,
+  // reload once automatically instead of relying on a manual force-quit.
+  let refreshedOnce = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshedOnce) return;
+    refreshedOnce = true;
+    window.location.reload();
+  });
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js').catch((err) => console.warn('SW registration failed', err));
+    navigator.serviceWorker.register('./sw.js').then((reg) => {
+      reg.update();
+    }).catch((err) => console.warn('SW registration failed', err));
   });
 }

@@ -534,3 +534,61 @@ textarea {
   font-size: 0.8rem;
   font-weight: 600;
 }
+
+/* ---- Stage 5: hour-by-hour schedule, live maps, geocoding ---- */
+
+.btn-expand-toggle {
+  border: none;
+  background: none;
+  color: var(--teal);
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 8px 0 2px;
+  cursor: pointer;
+  display: block;
+}
+
+.day-schedule {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+
+.sched-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid #f0ece0;
+  font-size: 0.82rem;
+}
+
+.sched-time {
+  flex: 0 0 92px;
+  font-weight: 700;
+  color: var(--teal-dark);
+}
+
+.sched-label { flex: 1; min-width: 0; }
+
+.sched-type {
+  background: var(--sand);
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--teal-dark);
+}
+
+.loc-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.geo-badge {
+  font-size: 0.68rem;
+  color: var(--sage);
+  font-weight: 600;
+}
