@@ -1,6 +1,6 @@
 /* ---------- Data layer ---------- */
 
-const APP_VERSION = 'v10 · ' + '2026-07-27';
+const APP_VERSION = 'v11 · ' + '2026-07-27';
 const STORAGE_KEY = 'tripPlannerData_v1';
 
 const DAY_TYPES = [
@@ -41,7 +41,8 @@ function defaultData() {
         wakeTime: '08:00',
         bedtime: '21:00',
         blocks: [ { startTime: '09:00', endTime: '11:00' }, { startTime: '21:00', endTime: '23:00' } ]
-      }
+      },
+      dismissedMilestones: []
     },
     stops: [],
     expenses: [], // { id, category, stopId, description, amountLocal, currency, amountUSD, fxRateUsed, fxDate, date, notes }
@@ -69,7 +70,7 @@ function defaultStop() {
     attractionBank: [],
     accommodations: [],
     transport: [],
-    countryInfo: { currency: '', language: '', plug: '', emergency: '', visaNotes: '', notes: '', lat: '', lon: '', timezone: '' }
+    countryInfo: { currency: '', language: '', plug: '', emergency: '', visaNotes: '', notes: '', lat: '', lon: '', timezone: '', chabadKosher: '', chabadVerifiedDate: '' }
   };
 }
 
@@ -775,6 +776,8 @@ function renderDashboard() {
   return `
     ${!start ? `<div class="card" style="background:#fff7e6;border-color:var(--amber)">Set your trip start date in <b>Settings</b> to see Today/Tomorrow and urgent items here.</div>` : ''}
 
+    ${renderMilestoneBanners()}
+
     <div class="section-title">Today &amp; tomorrow</div>
     ${renderTodayCard(todayEntry, 'Today')}
     ${renderTodayCard(tomorrowEntry, 'Tomorrow')}
@@ -967,6 +970,55 @@ function attachWeekPageHandlers() {
   if (backBtn) backBtn.addEventListener('click', () => setView('dashboard'));
 }
 
+/* ---------- Milestone banners ----------
+   Small, dismissible, date-driven celebrations. Since there's no way to push
+   a notification from a static app, each milestone stays visible for a short
+   grace window (not just its exact day) so it isn't missed if you don't open
+   the app that precise day — but each can be dismissed for good. */
+
+function getTripDateRange() {
+  const stops = computeStopDates().filter((s) => s.startDate);
+  if (!stops.length) return null;
+  return { start: stops[0].startDate, end: stops[stops.length - 1].endDate };
+}
+
+function computeMilestones() {
+  const range = getTripDateRange();
+  if (!range) return [];
+  const today = todayIso();
+  const dismissed = new Set(data.meta.dismissedMilestones || []);
+  const candidates = [];
+
+  candidates.push({ key: 'trip-start', date: range.start, emoji: '✈️', message: 'Your trip begins today!' });
+
+  const totalDays = Math.round((new Date(range.end + 'T00:00:00') - new Date(range.start + 'T00:00:00')) / 86400000);
+  if (totalDays > 1) {
+    candidates.push({ key: 'halfway', date: addDays(range.start, Math.floor(totalDays / 2)), emoji: '🎉', message: "You're halfway through the trip!" });
+  }
+
+  let d = range.start;
+  let guard = 0;
+  while (new Date(d + 'T00:00:00').getDay() !== 5 && guard < 7) { d = addDays(d, 1); guard++; }
+  candidates.push({ key: 'first-shabbat', date: d, emoji: '🕯', message: 'Your first Shabbat abroad begins tonight.' });
+
+  candidates.push({ key: 'one-month-return', date: addDays(range.end, -30), emoji: '📅', message: "One month until you're back in Israel." });
+  candidates.push({ key: 'trip-end', date: addDays(range.end, -1), emoji: '🏡', message: 'Last day of the trip — welcome home soon!' });
+
+  return candidates.filter((m) => !dismissed.has(m.key) && today >= m.date && today <= addDays(m.date, 2));
+}
+
+function renderMilestoneBanners() {
+  const milestones = computeMilestones();
+  if (!milestones.length) return '';
+  return milestones.map((m) => `
+    <div class="milestone-banner">
+      <span class="milestone-emoji">${m.emoji}</span>
+      <span class="milestone-text">${escapeHtml(m.message)}</span>
+      <button class="milestone-dismiss" data-action="dismiss-milestone" data-key="${m.key}">✕</button>
+    </div>
+  `).join('');
+}
+
 /* ---------- Route (country-level list) ---------- */
 
 function renderRoute() {
@@ -1072,16 +1124,19 @@ function renderZmanimPanel(stop, flag) {
   if (flag.sunset) bits.push(`<div class="zman-row"><span class="zman-label">Sunset</span><span class="zman-time">${flag.sunset}</span></div>`);
   if (flag.candleLighting) bits.push(`<div class="zman-row"><span class="zman-label">🕯 Candle lighting</span><span class="zman-time">${flag.candleLighting}</span></div>`);
   if (flag.havdalah) bits.push(`<div class="zman-row"><span class="zman-label">✨ Ends (havdalah)</span><span class="zman-time">${flag.havdalah}</span></div>`);
+  const chabadInfo = (stop.countryInfo || {}).chabadKosher;
+  const chabadLine = chabadInfo ? `<div class="zman-chabad">🕯 ${escapeHtml(chabadInfo)}</div>` : '';
   if (bits.length) {
     return `<div class="zmanim-panel">
       ${flag.isChag ? `<div class="zman-chag">🕎 ${escapeHtml(flag.chagName || 'Chag')}</div>` : ''}
       ${bits.join('')}
       <div class="zman-method">${settings.candleLightingMins} min before sunset · ${escapeHtml(havdalahMethodLabel(settings.havdalahMethod))} · times local to ${escapeHtml(stop.countryInfo.timezone || stop.country)}</div>
+      ${chabadLine}
     </div>`;
   } else if (hasLocation(stop)) {
-    return `<div class="zmanim-panel"><div class="hint-inline">Times unavailable for this date/latitude.</div></div>`;
+    return `<div class="zmanim-panel"><div class="hint-inline">Times unavailable for this date/latitude.</div>${chabadLine}</div>`;
   }
-  return '';
+  return chabadLine ? `<div class="zmanim-panel">${chabadLine}</div>` : '';
 }
 
 function renderDaysTab(stop, withDates) {
@@ -2007,6 +2062,10 @@ function initStopMap(stop) {
 
 function renderInfoTab(stop) {
   const info = stop.countryInfo || {};
+  const staleDays = info.chabadVerifiedDate ? Math.round((Date.now() - new Date(info.chabadVerifiedDate + 'T00:00:00')) / 86400000) : null;
+  const staleClass = staleDays === null ? '' : (staleDays > 60 ? 'stale-danger' : (staleDays > 30 ? 'stale-warn' : 'stale-fresh'));
+  const staleLabel = staleDays === null ? 'Not yet verified' : `Last verified ${formatDate(info.chabadVerifiedDate)} (${staleDays} day${staleDays === 1 ? '' : 's'} ago)`;
+
   return `
     <div class="card" style="background:#f0f7f5">
       <h3 style="margin:0 0 6px;font-size:0.9rem">Location for Shabbat &amp; holiday calculation</h3>
@@ -2026,6 +2085,25 @@ function renderInfoTab(stop) {
         <input name="timezone" value="${escapeAttr(info.timezone || '')}" placeholder="e.g. America/Lima" />
         <div class="form-actions">
           <button type="submit" class="btn btn-primary">Save location</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card" style="background:#f7f2e8">
+      <h3 style="margin:0 0 6px;font-size:0.9rem">🕯 Chabad &amp; kosher info</h3>
+      <p class="hint">Chabad house contact, kosher restaurants/stores, eruv info, minyan times — whatever you've found for this stop. This kind of info goes stale, so it's tracked with a last-verified date rather than treated as permanently accurate.</p>
+      <form class="inline-form" id="chabad-form" style="margin-top:8px;border:none;padding:0">
+        <textarea name="chabadKosher" rows="4" placeholder="e.g. Chabad of Cusco, Rabbi ___, +51 ___. Kosher-ish market at ___. No formal eruv.">${escapeHtml(info.chabadKosher || '')}</textarea>
+        <div class="form-row" style="margin-top:8px;align-items:flex-end">
+          <div>
+            <label>Verified on</label>
+            <input name="chabadVerifiedDate" type="date" value="${escapeAttr(info.chabadVerifiedDate || '')}" />
+          </div>
+          <button type="button" class="btn btn-secondary" id="btn-verify-today" style="flex:0 0 auto;height:42px">Mark verified today</button>
+        </div>
+        <div class="staleness-badge ${staleClass}">${staleLabel}</div>
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary">Save Chabad/kosher info</button>
         </div>
       </form>
     </div>
@@ -2623,6 +2701,12 @@ function attachHandlers() {
   document.querySelectorAll('[data-open-day]').forEach((b) => b.addEventListener('click', () => openDayPage(b.dataset.openDay, Number(b.dataset.day))));
   const weekLink = document.querySelector('[data-action="open-week"]');
   if (weekLink) weekLink.addEventListener('click', openWeekPage);
+  document.querySelectorAll('[data-action="dismiss-milestone"]').forEach((b) => b.addEventListener('click', () => {
+    if (!data.meta.dismissedMilestones) data.meta.dismissedMilestones = [];
+    data.meta.dismissedMilestones.push(b.dataset.key);
+    saveData();
+    render();
+  }));
   document.querySelectorAll('[data-jump-stop], [data-jump-budget]').forEach((b) => b.addEventListener('click', () => {
     if (b.dataset.jumpBudget) { setView('budget'); budgetSubTab = 'flights'; render(); return; }
     if (b.dataset.jumpStop) {
@@ -3066,6 +3150,20 @@ function attachInfoHandlers(stop) {
     render();
   });
 
+  const chabadForm = document.getElementById('chabad-form');
+  chabadForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const fd = new FormData(chabadForm);
+    stop.countryInfo.chabadKosher = (fd.get('chabadKosher') || '').trim();
+    stop.countryInfo.chabadVerifiedDate = fd.get('chabadVerifiedDate') || '';
+    saveData();
+    toast('Chabad/kosher info saved.');
+    render();
+  });
+  document.getElementById('btn-verify-today').addEventListener('click', () => {
+    document.querySelector('#chabad-form [name="chabadVerifiedDate"]').value = todayIso();
+  });
+
   const form = document.getElementById('info-form');
   form.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -3223,6 +3321,7 @@ function loadFromObject(parsed) {
   merged.meta.shabbatSettings = Object.assign({}, base.meta.shabbatSettings, (parsed.meta || {}).shabbatSettings || {});
   merged.meta.travelers = Object.assign({}, base.meta.travelers, (parsed.meta || {}).travelers || {});
   merged.meta.workDefaults = Object.assign({}, base.meta.workDefaults, (parsed.meta || {}).workDefaults || {});
+  merged.meta.dismissedMilestones = Array.isArray((parsed.meta || {}).dismissedMilestones) ? parsed.meta.dismissedMilestones : [];
   merged.expenses = Array.isArray(parsed.expenses) ? parsed.expenses : [];
   merged.awardFlights = Array.isArray(parsed.awardFlights) ? parsed.awardFlights : [];
   merged.bookings = Array.isArray(parsed.bookings) ? parsed.bookings : [];
