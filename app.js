@@ -15,11 +15,29 @@ const DAY_TYPES = [
 
 const TRANSPORT_MODES = ['Flight', 'Train', 'Bus', 'Car rental', 'Taxi / rideshare', 'Private driver', 'Public transit', 'Ferry', 'Other'];
 const TRANSPORT_KINDS = ['Arrival', 'Local', 'Departure'];
+const GUIDED_OPTIONS = ['Not set', 'Guided tour recommended', 'Can visit independently', 'Either works'];
+const EXPENSE_CATEGORIES = [
+  'Accommodation', 'Transportation', 'Flights', 'Food', 'Activities', 'Guides',
+  'Insurance', 'Visas', 'Medical', 'Remote work', 'Child-related', 'Points & miles', 'Contingency', 'Other'
+];
 
 function defaultData() {
   return {
-    meta: { tripStartDate: '', lastExportDate: null },
-    stops: []
+    meta: {
+      tripStartDate: '',
+      lastExportDate: null,
+      totalBudgetUSD: null,
+      fxRates: null // { base: 'USD', date: '...', rates: { PEN: 3.7, ... } }
+    },
+    stops: [],
+    expenses: [] // { id, category, stopId, description, amountLocal, currency, amountUSD, fxRateUsed, fxDate, date, notes }
+  };
+}
+
+function defaultAttraction() {
+  return {
+    id: '', name: '', description: '', location: '', guidedOrSelf: 'Not set',
+    gettingThere: '', whatToBring: '', notes: '', tags: [], source: 'manual', scheduledDay: null
   };
 }
 
@@ -30,7 +48,7 @@ function defaultStop() {
     attractionBank: [],
     accommodations: [],
     transport: [],
-    countryInfo: { currency: '', language: '', plug: '', emergency: '', visaNotes: '', notes: '' }
+    countryInfo: { currency: '', language: '', plug: '', emergency: '', visaNotes: '', notes: '', lat: '', lon: '', timezone: '' }
   };
 }
 
@@ -41,9 +59,7 @@ function loadData() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return defaultData();
     const parsed = JSON.parse(raw);
-    const merged = Object.assign(defaultData(), parsed);
-    merged.stops = (merged.stops || []).map((s) => Object.assign(defaultStop(), s));
-    return merged;
+    return loadFromObject(parsed);
   } catch (e) {
     console.error('Could not read saved data, starting fresh.', e);
     return defaultData();
@@ -99,6 +115,74 @@ function daysUntil(iso) {
   return Math.round((target - today) / 86400000);
 }
 
+/* ---------- Shabbat / holiday calendar (offline, via bundled Hebcal) ---------- */
+// Computes candle-lighting / havdalah times and Yom Tov (chag) flags for a stop's
+// date range, using its manually-entered coordinates. Everything here runs fully
+// offline once the app is loaded — no network call, no live lookup.
+
+function hasLocation(stop) {
+  const info = stop.countryInfo || {};
+  return !!(info.lat && info.lon && info.timezone);
+}
+
+function computeShabbatChagMap(stop, withDates) {
+  if (!withDates.startDate || !hasLocation(stop) || typeof Hebcal === 'undefined') return null;
+  const info = stop.countryInfo;
+  try {
+    const loc = new Hebcal.Location(parseFloat(info.lat), parseFloat(info.lon), false, info.timezone, stop.country, '');
+    const start = new Date(withDates.startDate + 'T00:00:00');
+    const end = new Date(withDates.endDate + 'T00:00:00');
+    const events = Hebcal.HebrewCalendar.calendar({ start, end, location: loc, candlelighting: true, il: false });
+    const map = {};
+    events.forEach((ev) => {
+      const iso = isoFromGregDate(ev.getDate().greg());
+      if (!map[iso]) map[iso] = { candleLighting: null, havdalah: null, isChag: false, chagName: null };
+      const f = ev.getFlags();
+      const desc = ev.render('en');
+      if (/Candle lighting/.test(desc)) {
+        const m = desc.match(/(\d{1,2}:\d{2})/);
+        map[iso].candleLighting = m ? m[1] : null;
+      }
+      if (/Havdalah/.test(desc)) {
+        const m = desc.match(/(\d{1,2}:\d{2})/);
+        map[iso].havdalah = m ? m[1] : null;
+      }
+      if (f & Hebcal.flags.CHAG) {
+        map[iso].isChag = true;
+        map[iso].chagName = desc.replace(/^\S+ /, '');
+      }
+    });
+    return map;
+  } catch (e) {
+    console.error('Shabbat/holiday calculation failed for this stop.', e);
+    return null;
+  }
+}
+
+function isoFromGregDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// For a given day (0-indexed within the stop), return its Shabbat/chag status.
+function getDayFlag(calMap, dateIso) {
+  if (!dateIso) return { restricted: false };
+  const dow = new Date(dateIso + 'T00:00:00').getDay(); // 0 Sun ... 5 Fri, 6 Sat
+  const entry = calMap ? calMap[dateIso] : null;
+  const isFriday = dow === 5;
+  const isSaturday = dow === 6;
+  const isChag = !!(entry && entry.isChag);
+  return {
+    restricted: isFriday || isSaturday || isChag,
+    isFriday, isSaturday, isChag,
+    candleLighting: entry ? entry.candleLighting : null,
+    havdalah: entry ? entry.havdalah : null,
+    chagName: entry ? entry.chagName : null
+  };
+}
+
 /* ---------- Toast ---------- */
 
 let toastTimer = null;
@@ -133,6 +217,35 @@ function openStop(id) {
   render();
 }
 
+/* ---------- Budget / currency ---------- */
+
+function convertToUSD(amount, currency) {
+  const amt = Number(amount);
+  if (!amt) return 0;
+  if (!currency || currency.toUpperCase() === 'USD') return amt;
+  const rates = data.meta.fxRates && data.meta.fxRates.rates;
+  const rate = rates ? rates[currency.toUpperCase()] : null;
+  if (!rate) return null; // unknown currency, can't convert yet
+  return amt / rate; // rates are USD -> currency, so invert
+}
+
+async function refreshFxRates(silent) {
+  try {
+    const resp = await fetch('https://open.er-api.com/v6/latest/USD');
+    const json = await resp.json();
+    if (json && json.result === 'success' && json.rates) {
+      data.meta.fxRates = { base: 'USD', date: json.time_last_update_utc || new Date().toISOString(), rates: json.rates };
+      saveData();
+      if (!silent) toast('Exchange rates updated.');
+      render();
+    } else {
+      if (!silent) toast('Could not refresh rates right now.');
+    }
+  } catch (e) {
+    if (!silent) toast('No connection — using last saved rates.');
+  }
+}
+
 /* ---------- Rendering root ---------- */
 
 function render() {
@@ -140,6 +253,7 @@ function render() {
   if (currentView === 'dashboard') main.innerHTML = renderDashboard();
   else if (currentView === 'route') main.innerHTML = renderRoute();
   else if (currentView === 'stop') main.innerHTML = renderStopWorkspace();
+  else if (currentView === 'budget') main.innerHTML = renderBudget();
   else if (currentView === 'settings') main.innerHTML = renderSettings();
   attachHandlers();
 }
@@ -152,7 +266,7 @@ function renderDashboard() {
   const toDeparture = daysUntil(start);
   const totalDays = stops.reduce((sum, s) => sum + Number(s.durationDays || 0), 0);
 
-  let unscheduled = 0, missingAccom = 0;
+  let unscheduled = 0, missingAccom = 0, calConflicts = 0, stopsNeedingLocation = 0;
   stops.forEach((s) => {
     unscheduled += (s.attractionBank || []).filter((a) => a.scheduledDay === null || a.scheduledDay === undefined).length;
     const nightsCovered = new Set();
@@ -160,6 +274,18 @@ function renderDashboard() {
       for (let i = a.startDayIndex; i < a.startDayIndex + a.nights; i++) nightsCovered.add(i);
     });
     if (nightsCovered.size < s.durationDays) missingAccom++;
+
+    if (!hasLocation(s)) {
+      stopsNeedingLocation++;
+    } else {
+      const calMap = computeShabbatChagMap(s, s);
+      (s.transport || []).forEach((t) => {
+        if (t.dayIndex !== null && t.dayIndex !== undefined && t.dayIndex !== '' && s.startDate) {
+          const date = addDays(s.startDate, Number(t.dayIndex));
+          if (getDayFlag(calMap, date).restricted) calConflicts++;
+        }
+      });
+    }
   });
 
   const chips = `
@@ -182,6 +308,14 @@ function renderDashboard() {
     <div class="stat-chip ${missingAccom ? 'danger' : ''}">
       <div class="num">${missingAccom}</div>
       <div class="label">Stops missing full stay coverage</div>
+    </div>
+    <div class="stat-chip ${calConflicts ? 'danger' : ''}">
+      <div class="num">${calConflicts}</div>
+      <div class="label">Shabbat/chag transport conflicts</div>
+    </div>
+    <div class="stat-chip ${stopsNeedingLocation ? 'warn' : ''}">
+      <div class="num">${stopsNeedingLocation}</div>
+      <div class="label">Stops needing location for Shabbat calc</div>
     </div>
   `;
 
@@ -300,15 +434,30 @@ function renderStopWorkspace() {
 /* ----- Days tab ----- */
 
 function renderDaysTab(stop, withDates) {
+  const calMap = computeShabbatChagMap(stop, withDates);
+  const locationSet = hasLocation(stop);
   const rows = [];
+
+  if (!locationSet) {
+    rows.push(`<div class="card" style="background:#fff7e6;border-color:var(--amber)">
+      Add this stop's coordinates in the <b>Country info</b> tab to automatically flag Shabbat and holiday days here.
+    </div>`);
+  }
+
   for (let i = 0; i < stop.durationDays; i++) {
     const date = withDates.startDate ? addDays(withDates.startDate, i) : '';
     const dayType = stop.dayTypes[i] || 'unset';
     const scheduled = (stop.attractionBank || []).filter((a) => a.scheduledDay === i);
     const accom = (stop.accommodations || []).find((a) => i >= a.startDayIndex && i < a.startDayIndex + a.nights);
+    const flag = getDayFlag(calMap, date);
+
+    let flagBadges = '';
+    if (flag.isFriday) flagBadges += `<span class="cal-badge shabbat">🕯 Shabbat begins${flag.candleLighting ? ' ' + flag.candleLighting : ''}</span>`;
+    if (flag.isSaturday) flagBadges += `<span class="cal-badge shabbat">✨ Shabbat ends${flag.havdalah ? ' ' + flag.havdalah : ''}</span>`;
+    if (flag.isChag) flagBadges += `<span class="cal-badge chag">🕎 ${escapeHtml(flag.chagName || 'Chag')}</span>`;
 
     rows.push(`
-      <div class="card day-card">
+      <div class="card day-card ${flag.restricted ? 'day-restricted' : ''}">
         <div class="day-card-head">
           <div>
             <div class="day-num">Day ${i + 1}</div>
@@ -318,6 +467,7 @@ function renderDaysTab(stop, withDates) {
             ${DAY_TYPES.map((dt) => `<option value="${dt.value}" ${dt.value === dayType ? 'selected' : ''}>${dt.label}</option>`).join('')}
           </select>
         </div>
+        ${flagBadges ? `<div class="cal-badges">${flagBadges}</div>` : ''}
         <div class="day-accom">${accom ? '🛏 Sleeping: ' + escapeHtml(accom.name) : '<span class="hint-inline">No accommodation set for this night — add one in the Stay tab.</span>'}</div>
         <div class="day-activities">
           ${scheduled.length ? scheduled.map((a) => `
@@ -363,10 +513,20 @@ function renderAttractionsTab(stop) {
     <div class="card attr-card">
       <div class="attr-main">
         <div class="attr-name">${escapeHtml(a.name)}</div>
+        ${a.description ? `<div class="hint">${escapeHtml(a.description)}</div>` : ''}
+        <div class="attr-meta">
+          ${a.location ? `<a class="map-link" target="_blank" rel="noopener" href="${mapsSearchUrl(a.location + ', ' + stop.country)}">📍 ${escapeHtml(a.location)} ↗</a>` : ''}
+          ${a.guidedOrSelf && a.guidedOrSelf !== 'Not set' ? `<span class="attr-tag">${escapeHtml(a.guidedOrSelf)}</span>` : ''}
+        </div>
+        ${a.gettingThere ? `<div class="hint">🚗 ${escapeHtml(a.gettingThere)}</div>` : ''}
+        ${a.whatToBring ? `<div class="hint">🎒 ${escapeHtml(a.whatToBring)}</div>` : ''}
         ${a.notes ? `<div class="hint">${escapeHtml(a.notes)}</div>` : ''}
         <div class="attr-status">${a.scheduledDay !== null && a.scheduledDay !== undefined ? '📅 Scheduled — Day ' + (a.scheduledDay + 1) : '— Unscheduled'}</div>
       </div>
-      <button class="icon-btn" data-action="delete-attraction" data-attr-id="${a.id}">✕</button>
+      <div class="actions">
+        <button class="icon-btn" data-action="edit-attraction" data-attr-id="${a.id}">✎</button>
+        <button class="icon-btn" data-action="delete-attraction" data-attr-id="${a.id}">✕</button>
+      </div>
     </div>
   `).join('') : `<div class="empty-state">No attractions yet. Add your own, or ask AI for suggestions below and import the list.</div>`;
 
@@ -376,14 +536,14 @@ function renderAttractionsTab(stop) {
 
     <div class="section-title">AI research helper</div>
     <div class="card">
-      <p class="hint">Build a ready-to-use prompt for this country, copy it into Claude (or any AI), then paste the suggestions back in below to add them all at once.</p>
+      <p class="hint">Build a ready-to-use prompt for this country, copy it into Claude (or any AI), then paste the full reply back in below — each suggestion becomes its own attraction, with location, tour info, getting there, and what to bring already filled in.</p>
       <button class="btn btn-secondary" id="btn-build-ai-prompt">Build AI prompt for ${escapeHtml(stop.country)}</button>
       <div id="ai-prompt-slot"></div>
     </div>
     <div class="card">
-      <label>Paste AI suggestions here (one per line)</label>
-      <textarea id="ai-import-text" rows="5" placeholder="Paste a list here, e.g.:&#10;Sacred Valley day trip&#10;Rainbow Mountain hike&#10;Cusco market and cooking class"></textarea>
-      <button class="btn btn-primary" id="btn-import-ai-list" style="margin-top:8px">Import list as attractions</button>
+      <label>Paste the AI's full reply here</label>
+      <textarea id="ai-import-text" rows="6" placeholder="Paste the AI's structured reply here (or a plain list — that still works too)"></textarea>
+      <button class="btn btn-primary" id="btn-import-ai-list" style="margin-top:8px">Import as attractions</button>
     </div>
 
     <div class="section-title">Bank</div>
@@ -391,15 +551,29 @@ function renderAttractionsTab(stop) {
   `;
 }
 
-function renderAttractionForm() {
+function renderAttractionForm(existing) {
+  const a = existing || defaultAttraction();
+  const isEdit = !!existing;
   return `
     <form class="inline-form" id="attraction-form">
       <label>Attraction / activity name</label>
-      <input name="name" required placeholder="e.g. Rainbow Mountain hike" />
-      <label>Notes (optional)</label>
-      <input name="notes" placeholder="booking needed, child-suitability, etc." />
+      <input name="name" value="${escapeAttr(a.name)}" required placeholder="e.g. Rainbow Mountain hike" />
+      <label>What it is</label>
+      <input name="description" value="${escapeAttr(a.description || '')}" placeholder="short description" />
+      <label>Location (for the map link)</label>
+      <input name="location" value="${escapeAttr(a.location || '')}" placeholder="e.g. Vinicunca, Cusco region" />
+      <label>Guided tour or self-guided?</label>
+      <select name="guidedOrSelf">
+        ${GUIDED_OPTIONS.map((g) => `<option value="${g}" ${g === a.guidedOrSelf ? 'selected' : ''}>${g}</option>`).join('')}
+      </select>
+      <label>Getting there</label>
+      <input name="gettingThere" value="${escapeAttr(a.gettingThere || '')}" placeholder="e.g. 3hr drive from Cusco, or organized transfer" />
+      <label>What to bring</label>
+      <input name="whatToBring" value="${escapeAttr(a.whatToBring || '')}" placeholder="e.g. warm layers, altitude meds, cash for entry" />
+      <label>Other notes</label>
+      <input name="notes" value="${escapeAttr(a.notes || '')}" />
       <div class="form-actions">
-        <button type="submit" class="btn btn-primary">Add to bank</button>
+        <button type="submit" class="btn btn-primary">${isEdit ? 'Save changes' : 'Add to bank'}</button>
         <button type="button" class="btn btn-secondary" id="cancel-attraction-form">Cancel</button>
       </div>
     </form>
@@ -416,7 +590,69 @@ Context:
 - Practical needs: road quality, child safety, nap disruption, and whether private transport helps should factor into suggestions
 - We keep Shabbat (no Friday-Saturday travel) and would like Chabad/kosher notes if relevant
 
-Please suggest a list of specific attractions/activities in ${stop.country} that fit this, each as one line with a short reason, so I can paste them into my planning app.`;
+Please suggest 6-10 specific attractions/activities in ${stop.country} that fit this. IMPORTANT — reply using exactly this format for each one, so I can import it directly into my planning app:
+
+### Attraction Name
+What: one or two sentence description of what it is
+Where: specific place/neighborhood name (for a map search)
+Tour or self-guided: Guided tour recommended / Can visit independently / Either works
+Getting there: how to get there from a typical base, and travel time
+What to bring: brief list (gear, altitude meds, cash, etc.)
+Notes: child-suitability, booking-ahead needs, or anything else worth knowing
+
+Repeat that block for each suggestion. Please don't add any other text before, between, or after the blocks.`;
+}
+
+/* ----- Smart parser for the structured AI reply ----- */
+// Understands the "### Title / What: / Where: / Tour or self-guided: / Getting there: /
+// What to bring: / Notes:" format from buildAiPrompt(). Falls back to one-attraction-per-line
+// for plain pasted lists that don't use that format, so nothing is ever lost.
+
+function parseAiImportText(text) {
+  const hasStructured = /^###\s+/m.test(text);
+  if (!hasStructured) {
+    return text.split('\n')
+      .map((l) => l.replace(/^[\s\-•*\d.)]+/, '').trim())
+      .filter((l) => l.length > 0)
+      .map((name) => Object.assign(defaultAttraction(), { name, source: 'ai-import' }));
+  }
+
+  const blocks = text.split(/^###\s+/m).slice(1); // drop any preamble before the first ###
+  const fieldPatterns = [
+    ['description', /^what:\s*(.*)$/i],
+    ['location', /^where:\s*(.*)$/i],
+    ['guidedOrSelf', /^tour or self-guided:\s*(.*)$/i],
+    ['gettingThere', /^getting there:\s*(.*)$/i],
+    ['whatToBring', /^what to bring:\s*(.*)$/i],
+    ['notes', /^notes:\s*(.*)$/i]
+  ];
+
+  return blocks.map((block) => {
+    const lines = block.split('\n').map((l) => l.trim()).filter((l) => l.length);
+    if (!lines.length) return null;
+    const attr = Object.assign(defaultAttraction(), { name: lines[0], source: 'ai-import' });
+    for (const line of lines.slice(1)) {
+      let matched = false;
+      for (const [field, pattern] of fieldPatterns) {
+        const m = line.match(pattern);
+        if (m) {
+          attr[field] = (attr[field] ? attr[field] + ' ' : '') + m[1].trim();
+          matched = true;
+          break;
+        }
+      }
+      if (!matched && line) {
+        attr.notes = attr.notes ? attr.notes + ' ' + line : line;
+      }
+    }
+    // normalize guidedOrSelf to one of our select options where possible
+    const gs = (attr.guidedOrSelf || '').toLowerCase();
+    if (gs.includes('guided')) attr.guidedOrSelf = 'Guided tour recommended';
+    else if (gs.includes('independent') || gs.includes('alone') || gs.includes('self')) attr.guidedOrSelf = 'Can visit independently';
+    else if (gs.includes('either')) attr.guidedOrSelf = 'Either works';
+    else if (!gs) attr.guidedOrSelf = 'Not set';
+    return attr;
+  }).filter(Boolean);
 }
 
 /* ----- Stay tab (accommodation) ----- */
@@ -486,18 +722,32 @@ function renderAccomForm(stop) {
 /* ----- Transport tab ----- */
 
 function renderTransportTab(stop) {
+  const withDates = stopWithDatesById(stop.id);
+  const calMap = computeShabbatChagMap(stop, withDates);
   const list = stop.transport || [];
-  const rows = list.length ? list.map((t) => `
+  const rows = list.length ? list.map((t) => {
+    let warning = '';
+    if (t.dayIndex !== null && t.dayIndex !== undefined && t.dayIndex !== '' && withDates.startDate) {
+      const date = addDays(withDates.startDate, Number(t.dayIndex));
+      const flag = getDayFlag(calMap, date);
+      if (flag.restricted) {
+        const reason = flag.isChag ? (flag.chagName || 'a chag') : 'Shabbat';
+        warning = `<div class="cal-warning">⚠ This falls on ${escapeHtml(reason)} — avoid travel on this day.</div>`;
+      }
+    }
+    return `
     <div class="card">
       <div class="attr-main">
         <div class="attr-name">${t.kind} · ${escapeHtml(t.mode)}</div>
         <div class="hint">${escapeHtml(t.detail || '')}${t.dayIndex !== null && t.dayIndex !== undefined && t.dayIndex !== '' ? ' · Day ' + (Number(t.dayIndex) + 1) : ''}${t.cost ? ' · ' + t.cost + ' ' + escapeHtml(t.currency || '') : ''}</div>
+        ${warning}
         ${t.confirmation ? `<div class="hint">Confirmation: ${escapeHtml(t.confirmation)}</div>` : ''}
         ${t.notes ? `<div class="hint">${escapeHtml(t.notes)}</div>` : ''}
       </div>
       <button class="icon-btn" data-action="delete-transport" data-transport-id="${t.id}">✕</button>
     </div>
-  `).join('') : `<div class="empty-state">No transport entries yet — add flights, car rentals, transfers, or local transport notes.</div>`;
+  `;
+  }).join('') : `<div class="empty-state">No transport entries yet — add flights, car rentals, transfers, or local transport notes.</div>`;
 
   return `
     <button class="btn btn-primary btn-block" id="btn-add-transport">+ Add transport</button>
@@ -545,6 +795,28 @@ function renderTransportForm(stop) {
 function renderInfoTab(stop) {
   const info = stop.countryInfo || {};
   return `
+    <div class="card" style="background:#f0f7f5">
+      <h3 style="margin:0 0 6px;font-size:0.9rem">Location for Shabbat &amp; holiday calculation</h3>
+      <p class="hint">Enter this stop's approximate coordinates and timezone once, and candle-lighting, havdalah, and holiday days will be flagged automatically on the Days and Transport tabs — fully offline. Tip: search "[city] latitude longitude" or long-press the location in Google Maps to copy coordinates.</p>
+      <form class="inline-form" id="location-form" style="margin-top:8px;border:none;padding:0">
+        <div class="form-row">
+          <div>
+            <label>Latitude</label>
+            <input name="lat" value="${escapeAttr(info.lat || '')}" placeholder="e.g. -13.53" />
+          </div>
+          <div>
+            <label>Longitude</label>
+            <input name="lon" value="${escapeAttr(info.lon || '')}" placeholder="e.g. -71.97" />
+          </div>
+        </div>
+        <label>Timezone (IANA name)</label>
+        <input name="timezone" value="${escapeAttr(info.timezone || '')}" placeholder="e.g. America/Lima" />
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary">Save location</button>
+        </div>
+      </form>
+    </div>
+
     <form class="inline-form" id="info-form">
       <p class="hint">Manual notes — enter this yourself from your own research, or paste in facts you've verified. Nothing here is looked up automatically.</p>
       <label>Currency</label>
@@ -564,6 +836,166 @@ function renderInfoTab(stop) {
       </div>
     </form>
   `;
+}
+
+/* ---------- Budget page ---------- */
+
+function renderBudget() {
+  const expenses = data.expenses || [];
+  const totalUSD = expenses.reduce((sum, e) => sum + (Number(e.amountUSD) || 0), 0);
+  const budget = data.meta.totalBudgetUSD;
+  const pct = budget ? Math.min(100, Math.round((totalUSD / budget) * 100)) : null;
+
+  const byCategory = {};
+  expenses.forEach((e) => { byCategory[e.category] = (byCategory[e.category] || 0) + (Number(e.amountUSD) || 0); });
+  const catRows = EXPENSE_CATEGORIES
+    .filter((c) => byCategory[c])
+    .sort((a, b) => byCategory[b] - byCategory[a])
+    .map((c) => `
+      <div class="cat-row">
+        <div class="cat-label">${c}</div>
+        <div class="cat-bar-track"><div class="cat-bar-fill" style="width:${budget ? Math.min(100, (byCategory[c] / totalUSD) * 100) : 0}%"></div></div>
+        <div class="cat-amount">$${byCategory[c].toFixed(0)}</div>
+      </div>
+    `).join('');
+
+  const fxInfo = data.meta.fxRates
+    ? `Rates as of ${new Date(data.meta.fxRates.date).toLocaleDateString()}`
+    : 'No exchange rates loaded yet';
+
+  const stopOptions = data.stops.map((s) => `<option value="${s.id}">${escapeHtml(s.country)}</option>`).join('');
+
+  const expenseRows = expenses.length
+    ? [...expenses].sort((a, b) => (b.date || '').localeCompare(a.date || '')).map((e) => {
+        const stop = stopById(e.stopId);
+        const converted = e.amountUSD === null ? '<span style="color:var(--red)">unconverted</span>' : '$' + Number(e.amountUSD).toFixed(2);
+        return `
+        <div class="card">
+          <div class="attr-main">
+            <div class="attr-name">${escapeHtml(e.description || e.category)} <span class="hint">· ${e.category}</span></div>
+            <div class="hint">${e.amountLocal} ${escapeHtml(e.currency)} → ${converted}${stop ? ' · ' + escapeHtml(stop.country) : ''}${e.date ? ' · ' + e.date : ''}</div>
+            ${e.notes ? `<div class="hint">${escapeHtml(e.notes)}</div>` : ''}
+          </div>
+          <button class="icon-btn" data-action="delete-expense" data-expense-id="${e.id}">✕</button>
+        </div>`;
+      }).join('')
+    : `<div class="empty-state">No expenses logged yet.</div>`;
+
+  return `
+    <div class="section-title">Budget</div>
+    <div class="card">
+      <div class="form-row">
+        <div>
+          <label class="hint" style="display:block;margin-bottom:4px">Total trip budget (USD)</label>
+          <input type="number" id="total-budget-input" value="${budget || ''}" placeholder="e.g. 60000" />
+        </div>
+      </div>
+      ${budget ? `
+        <div class="budget-bar-track" style="margin-top:12px">
+          <div class="budget-bar-fill ${pct >= 100 ? 'over' : ''}" style="width:${pct}%"></div>
+        </div>
+        <div class="hint" style="margin-top:6px">$${totalUSD.toFixed(0)} of $${Number(budget).toFixed(0)} spent/committed (${pct}%)</div>
+      ` : `<p class="hint" style="margin-top:8px">Set a total budget to see spend-so-far as a percentage.</p>`}
+    </div>
+
+    <div class="card">
+      <div class="hint">${fxInfo}</div>
+      <button class="btn btn-secondary" id="btn-refresh-fx" style="margin-top:8px">Refresh exchange rates</button>
+    </div>
+
+    ${catRows ? `<div class="section-title">By category</div>${catRows}` : ''}
+
+    <button class="btn btn-primary btn-block" id="btn-add-expense" style="margin-top:14px">+ Add expense</button>
+    <div id="expense-form-slot"></div>
+
+    <div class="section-title">All expenses</div>
+    ${expenseRows}
+  `;
+}
+
+function renderExpenseForm(stopOptionsHtml) {
+  return `
+    <form class="inline-form" id="expense-form">
+      <label>Category</label>
+      <select name="category">${EXPENSE_CATEGORIES.map((c) => `<option value="${c}">${c}</option>`).join('')}</select>
+      <label>Description</label>
+      <input name="description" placeholder="e.g. Cusco apartment, week 2" />
+      <label>Country / stop (optional)</label>
+      <select name="stopId">
+        <option value="">— trip-wide / not tied to one stop —</option>
+        ${stopOptionsHtml}
+      </select>
+      <div class="form-row">
+        <div>
+          <label>Amount</label>
+          <input name="amountLocal" type="number" min="0" step="0.01" required />
+        </div>
+        <div>
+          <label>Currency</label>
+          <input name="currency" placeholder="USD" value="USD" required />
+        </div>
+      </div>
+      <label>Date</label>
+      <input name="date" type="date" />
+      <label>Notes</label>
+      <input name="notes" />
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Add expense</button>
+        <button type="button" class="btn btn-secondary" id="cancel-expense-form">Cancel</button>
+      </div>
+    </form>
+  `;
+}
+
+function attachBudgetHandlers() {
+  document.getElementById('total-budget-input').addEventListener('change', (e) => {
+    const v = parseFloat(e.target.value);
+    data.meta.totalBudgetUSD = isNaN(v) ? null : v;
+    saveData();
+    render();
+  });
+
+  document.getElementById('btn-refresh-fx').addEventListener('click', () => refreshFxRates(false));
+
+  const addBtn = document.getElementById('btn-add-expense');
+  if (addBtn) addBtn.addEventListener('click', () => {
+    const stopOptionsHtml = data.stops.map((s) => `<option value="${s.id}">${escapeHtml(s.country)}</option>`).join('');
+    document.getElementById('expense-form-slot').innerHTML = renderExpenseForm(stopOptionsHtml);
+    const form = document.getElementById('expense-form');
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      const currency = (fd.get('currency') || 'USD').trim().toUpperCase();
+      const amountLocal = parseFloat(fd.get('amountLocal')) || 0;
+      const amountUSD = convertToUSD(amountLocal, currency);
+      data.expenses.push({
+        id: uid('exp'),
+        category: fd.get('category'),
+        description: (fd.get('description') || '').trim(),
+        stopId: fd.get('stopId') || null,
+        amountLocal, currency,
+        amountUSD,
+        fxRateUsed: data.meta.fxRates ? (data.meta.fxRates.rates[currency] || null) : null,
+        fxDate: data.meta.fxRates ? data.meta.fxRates.date : null,
+        date: fd.get('date') || '',
+        notes: (fd.get('notes') || '').trim()
+      });
+      saveData();
+      if (amountUSD === null) toast('Saved — but that currency isn\'t in your rates yet. Tap "Refresh exchange rates".');
+      else toast('Expense added.');
+      render();
+    });
+    document.getElementById('cancel-expense-form').addEventListener('click', () => {
+      document.getElementById('expense-form-slot').innerHTML = '';
+    });
+  });
+
+  document.querySelectorAll('[data-action="delete-expense"]').forEach((b) => b.addEventListener('click', () => {
+    if (!confirm('Remove this expense?')) return;
+    data.expenses = data.expenses.filter((e) => e.id !== b.dataset.expenseId);
+    saveData();
+    render();
+  }));
 }
 
 /* ---------- Settings ---------- */
@@ -605,6 +1037,7 @@ function attachHandlers() {
 
   if (currentView === 'route') attachRouteHandlers();
   if (currentView === 'stop') attachStopHandlers();
+  if (currentView === 'budget') attachBudgetHandlers();
   if (currentView === 'settings') attachSettingsHandlers();
 }
 
@@ -637,8 +1070,15 @@ function wireStopForm(existing) {
       toast('Stop updated.');
     } else {
       const s = Object.assign(defaultStop(), { id: uid('stop'), country, durationDays, notes });
+      const defaults = typeof lookupCountryData === 'function' ? lookupCountryData(country) : null;
+      if (defaults) {
+        Object.assign(s.countryInfo, {
+          currency: defaults.currency || '', language: defaults.language || '', plug: defaults.plug || '',
+          emergency: defaults.emergency || '', lat: String(defaults.lat), lon: String(defaults.lon), timezone: defaults.timezone || ''
+        });
+      }
       data.stops.push(s);
-      toast('Stop added.');
+      toast(defaults ? 'Stop added — country info auto-filled (check & adjust in Country info tab).' : 'Stop added.');
     }
     saveData();
     render();
@@ -719,7 +1159,7 @@ function wireActivityPicker(stop, dayIndex) {
     const input = document.getElementById('picker-newname-' + dayIndex);
     const name = input.value.trim();
     if (!name) return;
-    stop.attractionBank.push({ id: uid('attr'), name, notes: '', tags: [], source: 'manual', scheduledDay: dayIndex });
+    stop.attractionBank.push(Object.assign(defaultAttraction(), { id: uid('attr'), name, source: 'manual', scheduledDay: dayIndex }));
     saveData();
     render();
   });
@@ -728,22 +1168,15 @@ function wireActivityPicker(stop, dayIndex) {
 function attachAttractionsHandlers(stop) {
   const addBtn = document.getElementById('btn-add-attraction');
   if (addBtn) addBtn.addEventListener('click', () => {
-    document.getElementById('attraction-form-slot').innerHTML = renderAttractionForm();
-    const form = document.getElementById('attraction-form');
-    form.addEventListener('submit', (e) => {
-      e.preventDefault();
-      const fd = new FormData(form);
-      stop.attractionBank.push({
-        id: uid('attr'), name: fd.get('name').trim(), notes: (fd.get('notes') || '').trim(),
-        tags: [], source: 'manual', scheduledDay: null
-      });
-      saveData();
-      render();
-    });
-    document.getElementById('cancel-attraction-form').addEventListener('click', () => {
-      document.getElementById('attraction-form-slot').innerHTML = '';
-    });
+    document.getElementById('attraction-form-slot').innerHTML = renderAttractionForm(null);
+    wireAttractionForm(stop, null);
   });
+
+  document.querySelectorAll('[data-action="edit-attraction"]').forEach((b) => b.addEventListener('click', () => {
+    const a = stop.attractionBank.find((x) => x.id === b.dataset.attrId);
+    document.getElementById('attraction-form-slot').innerHTML = renderAttractionForm(a);
+    wireAttractionForm(stop, a);
+  }));
 
   document.querySelectorAll('[data-action="delete-attraction"]').forEach((b) => b.addEventListener('click', () => {
     if (!confirm('Remove this attraction?')) return;
@@ -756,7 +1189,7 @@ function attachAttractionsHandlers(stop) {
   if (promptBtn) promptBtn.addEventListener('click', () => {
     const prompt = buildAiPrompt(stop);
     document.getElementById('ai-prompt-slot').innerHTML = `
-      <textarea id="ai-prompt-text" rows="8" readonly>${escapeHtml(prompt)}</textarea>
+      <textarea id="ai-prompt-text" rows="10" readonly>${escapeHtml(prompt)}</textarea>
       <button class="btn btn-primary" id="btn-copy-ai-prompt" style="margin-top:8px">Copy prompt</button>
     `;
     document.getElementById('btn-copy-ai-prompt').addEventListener('click', () => {
@@ -774,14 +1207,45 @@ function attachAttractionsHandlers(stop) {
   const importBtn = document.getElementById('btn-import-ai-list');
   if (importBtn) importBtn.addEventListener('click', () => {
     const text = document.getElementById('ai-import-text').value;
-    const lines = text.split('\n')
-      .map((l) => l.replace(/^[\s\-•*\d.)]+/, '').trim())
-      .filter((l) => l.length > 0);
-    if (!lines.length) { toast('Nothing to import.'); return; }
-    lines.forEach((name) => stop.attractionBank.push({ id: uid('attr'), name, notes: '', tags: [], source: 'ai-import', scheduledDay: null }));
+    const parsed = parseAiImportText(text);
+    if (!parsed.length) { toast('Nothing to import.'); return; }
+    parsed.forEach((attr) => {
+      attr.id = uid('attr');
+      stop.attractionBank.push(attr);
+    });
     saveData();
-    toast(`Imported ${lines.length} attraction${lines.length === 1 ? '' : 's'}.`);
+    toast(`Imported ${parsed.length} attraction${parsed.length === 1 ? '' : 's'}.`);
     render();
+  });
+}
+
+function wireAttractionForm(stop, existing) {
+  const form = document.getElementById('attraction-form');
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const values = {
+      name: fd.get('name').trim(),
+      description: (fd.get('description') || '').trim(),
+      location: (fd.get('location') || '').trim(),
+      guidedOrSelf: fd.get('guidedOrSelf'),
+      gettingThere: (fd.get('gettingThere') || '').trim(),
+      whatToBring: (fd.get('whatToBring') || '').trim(),
+      notes: (fd.get('notes') || '').trim()
+    };
+    if (existing) {
+      Object.assign(existing, values);
+      toast('Attraction updated.');
+    } else {
+      stop.attractionBank.push(Object.assign(defaultAttraction(), values, { id: uid('attr'), source: 'manual' }));
+      toast('Attraction added.');
+    }
+    saveData();
+    document.getElementById('attraction-form-slot').innerHTML = '';
+    render();
+  });
+  document.getElementById('cancel-attraction-form').addEventListener('click', () => {
+    document.getElementById('attraction-form-slot').innerHTML = '';
   });
 }
 
@@ -855,18 +1319,30 @@ function attachTransportHandlers(stop) {
 }
 
 function attachInfoHandlers(stop) {
+  const locForm = document.getElementById('location-form');
+  locForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const fd = new FormData(locForm);
+    stop.countryInfo.lat = (fd.get('lat') || '').trim();
+    stop.countryInfo.lon = (fd.get('lon') || '').trim();
+    stop.countryInfo.timezone = (fd.get('timezone') || '').trim();
+    saveData();
+    toast('Location saved — Shabbat/holiday flags updated.');
+    render();
+  });
+
   const form = document.getElementById('info-form');
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     const fd = new FormData(form);
-    stop.countryInfo = {
+    Object.assign(stop.countryInfo, {
       currency: (fd.get('currency') || '').trim(),
       language: (fd.get('language') || '').trim(),
       plug: (fd.get('plug') || '').trim(),
       emergency: (fd.get('emergency') || '').trim(),
       visaNotes: (fd.get('visaNotes') || '').trim(),
       notes: (fd.get('notes') || '').trim()
-    };
+    });
     saveData();
     toast('Country info saved.');
   });
@@ -923,8 +1399,16 @@ function importData(e) {
 }
 
 function loadFromObject(parsed) {
-  const merged = Object.assign(defaultData(), parsed);
-  merged.stops = (merged.stops || []).map((s) => Object.assign(defaultStop(), s));
+  const base = defaultData();
+  const merged = Object.assign({}, base, parsed);
+  merged.meta = Object.assign({}, base.meta, parsed.meta || {});
+  merged.expenses = Array.isArray(parsed.expenses) ? parsed.expenses : [];
+  merged.stops = (parsed.stops || []).map((s) => {
+    const stop = Object.assign(defaultStop(), s);
+    stop.countryInfo = Object.assign({}, defaultStop().countryInfo, s.countryInfo || {});
+    stop.attractionBank = (s.attractionBank || []).map((a) => Object.assign(defaultAttraction(), a));
+    return stop;
+  });
   return merged;
 }
 
@@ -939,6 +1423,10 @@ function escapeAttr(str) { return escapeHtml(str); }
 
 document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
 render();
+
+if (!data.meta.fxRates) {
+  refreshFxRates(true);
+}
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {

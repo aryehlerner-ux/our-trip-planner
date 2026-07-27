@@ -1,4 +1,4 @@
-const CACHE_NAME = 'trip-planner-v2';
+const CACHE_NAME = 'trip-planner-v4';
 const ASSETS = [
   './',
   './index.html',
@@ -6,7 +6,9 @@ const ASSETS = [
   './style.css',
   './manifest.json',
   './icon-192.png',
-  './icon-512.png'
+  './icon-512.png',
+  './hebcal-bundle.js',
+  './country-data.js'
 ];
 
 self.addEventListener('install', (event) => {

@@ -428,3 +428,109 @@ textarea {
   font-family: inherit;
   resize: vertical;
 }
+
+/* ---- Stage 3: Shabbat / holiday calendar ---- */
+
+.day-restricted {
+  border-left: 4px solid var(--teal);
+  background: #f4faf9;
+}
+
+.cal-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.cal-badge {
+  font-size: 0.72rem;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-weight: 600;
+}
+
+.cal-badge.shabbat {
+  background: #dcecea;
+  color: var(--teal-dark);
+}
+
+.cal-badge.chag {
+  background: #f4e2dd;
+  color: var(--red);
+}
+
+.cal-warning {
+  font-size: 0.78rem;
+  color: var(--red);
+  font-weight: 600;
+  margin: 4px 0;
+}
+
+/* ---- Stage 4: budget + richer attractions ---- */
+
+.attr-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 4px 0;
+}
+
+.attr-tag {
+  font-size: 0.7rem;
+  background: var(--sand);
+  color: var(--teal-dark);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-weight: 600;
+}
+
+.budget-bar-track {
+  width: 100%;
+  height: 12px;
+  background: var(--sand);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.budget-bar-fill {
+  height: 100%;
+  background: var(--sage);
+  border-radius: 999px;
+}
+
+.budget-bar-fill.over { background: var(--red); }
+
+.cat-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+}
+
+.cat-label {
+  flex: 0 0 110px;
+  font-size: 0.8rem;
+}
+
+.cat-bar-track {
+  flex: 1;
+  height: 8px;
+  background: var(--sand);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.cat-bar-fill {
+  height: 100%;
+  background: var(--teal);
+  border-radius: 999px;
+}
+
+.cat-amount {
+  flex: 0 0 60px;
+  text-align: right;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
