@@ -1,6 +1,6 @@
 /* ---------- Data layer ---------- */
 
-const APP_VERSION = 'v13 · ' + '2026-07-28';
+const APP_VERSION = 'v14 · ' + '2026-07-28';
 const STORAGE_KEY = 'tripPlannerData_v1';
 
 const DAY_TYPES = [
@@ -68,7 +68,7 @@ function defaultAttraction() {
     gettingThere: '', whatToBring: '', notes: '', tags: [], source: 'manual', scheduledDay: null,
     geoLat: null, geoLon: null,
     durationMins: '', confirmation: '', bookingLink: '',
-    costEstimate: '', suggestedDuration: '', // freeform, AI-provided — not the structured cost/duration you confirm yourself
+    costEstimate: '', suggestedDuration: '', priority: '', // freeform, AI-provided — not the structured cost/duration you confirm yourself
     cost: defaultCost()
   };
 }
@@ -375,15 +375,38 @@ function eventTime24(ev, timezone) {
   return String(hh).padStart(2, '0') + ':' + mm;
 }
 
+let lastShabbatCalcError = null; // surfaced in the UI instead of a dead-end generic message
+
 function computeShabbatChagMap(stop, withDates) {
   if (!withDates.startDate || !hasLocation(stop) || typeof Hebcal === 'undefined') return null;
   const info = stop.countryInfo;
   const settings = getShabbatSettings();
-  try {
-    const loc = new Hebcal.Location(parseFloat(info.lat), parseFloat(info.lon), false, info.timezone, stop.country, '');
-    const start = new Date(withDates.startDate + 'T00:00:00');
-    const end = new Date(withDates.endDate + 'T00:00:00');
 
+  const lat = parseFloat(info.lat);
+  const lon = parseFloat(info.lon);
+  if (!isFinite(lat) || !isFinite(lon) || !info.timezone) {
+    lastShabbatCalcError = `Invalid coordinates or timezone for ${stop.country} (lat: "${info.lat}", lon: "${info.lon}", tz: "${info.timezone}")`;
+    console.error(lastShabbatCalcError);
+    return null;
+  }
+
+  let loc;
+  try {
+    loc = new Hebcal.Location(lat, lon, false, info.timezone, stop.country, '');
+  } catch (e) {
+    lastShabbatCalcError = `Could not create a location for ${stop.country} (${lat}, ${lon}, ${info.timezone}): ${e.message}`;
+    console.error(lastShabbatCalcError, e);
+    return null;
+  }
+
+  const start = new Date(withDates.startDate + 'T00:00:00');
+  const end = new Date(withDates.endDate + 'T00:00:00');
+  const map = {};
+
+  // Calendar events (candle-lighting/havdalah times, chag flags) — isolated in
+  // its own try/catch so a failure here doesn't also wipe out the separate
+  // sunset calculation below.
+  try {
     const calOpts = {
       start, end, location: loc, candlelighting: true, il: false,
       candleLightingMins: settings.candleLightingMins
@@ -392,7 +415,6 @@ function computeShabbatChagMap(stop, withDates) {
     if (method.deg) calOpts.havdalahDeg = method.deg; else calOpts.havdalahMins = method.mins;
 
     const events = Hebcal.HebrewCalendar.calendar(calOpts);
-    const map = {};
     events.forEach((ev) => {
       const iso = isoFromGregDate(ev.getDate().greg());
       if (!map[iso]) map[iso] = { candleLighting: null, havdalah: null, sunset: null, isChag: false, chagName: null };
@@ -413,31 +435,40 @@ function computeShabbatChagMap(stop, withDates) {
         map[iso].chagName = desc.replace(/^\S+ /, '');
       }
     });
-
-    // Add exact sunset for every day in range that matters (Fri/Sat/chag).
-    // Computed separately because sunset isn't emitted as a calendar event.
-    let cursor = withDates.startDate;
-    while (cursor && cursor <= withDates.endDate) {
-      const d = new Date(cursor + 'T12:00:00');
-      const dow = new Date(cursor + 'T00:00:00').getDay();
-      const entry = map[cursor];
-      if (dow === 5 || dow === 6 || (entry && entry.isChag)) {
-        if (!map[cursor]) map[cursor] = { candleLighting: null, havdalah: null, sunset: null, isChag: false, chagName: null };
-        try {
-          const z = new Hebcal.Zmanim(loc, d);
-          map[cursor].sunset = formatTimeInZone(z.sunset(), info.timezone);
-        } catch (e) {
-          map[cursor].sunset = null; // extreme latitude or unavailable
-        }
-      }
-      cursor = addDays(cursor, 1);
-    }
-
-    return map;
   } catch (e) {
-    console.error('Shabbat/holiday calculation failed for this stop.', e);
-    return null;
+    lastShabbatCalcError = `Candle-lighting/havdalah calendar lookup failed for ${stop.country}: ${e.message}`;
+    console.error(lastShabbatCalcError, e);
+    // fall through — sunset can still be computed independently below
   }
+
+  // Add exact sunset for every day in range that matters (Fri/Sat/chag).
+  // Computed separately because sunset isn't emitted as a calendar event, and
+  // isolated per-day so one bad date doesn't block the rest of the range.
+  let cursor = withDates.startDate;
+  let sunsetFailures = 0;
+  while (cursor && cursor <= withDates.endDate) {
+    const d = new Date(cursor + 'T12:00:00');
+    const dow = new Date(cursor + 'T00:00:00').getDay();
+    const entry = map[cursor];
+    if (dow === 5 || dow === 6 || (entry && entry.isChag)) {
+      if (!map[cursor]) map[cursor] = { candleLighting: null, havdalah: null, sunset: null, isChag: false, chagName: null };
+      try {
+        const z = new Hebcal.Zmanim(loc, d);
+        map[cursor].sunset = formatTimeInZone(z.sunset(), info.timezone);
+      } catch (e) {
+        map[cursor].sunset = null; // extreme latitude or unavailable
+        sunsetFailures++;
+        console.error(`Sunset calculation failed for ${stop.country} on ${cursor}:`, e.message);
+      }
+    }
+    cursor = addDays(cursor, 1);
+  }
+  if (sunsetFailures > 0) {
+    lastShabbatCalcError = `Sunset unavailable for ${sunsetFailures} date(s) in ${stop.country} — see console for details.`;
+  } else if (Object.keys(map).length > 0) {
+    lastShabbatCalcError = null; // success — clear any earlier error
+  }
+  return map;
 }
 
 function isoFromGregDate(d) {
@@ -1180,7 +1211,8 @@ function renderZmanimPanel(stop, flag) {
       ${chabadLine}
     </div>`;
   } else if (hasLocation(stop)) {
-    return `<div class="zmanim-panel"><div class="hint-inline">Times unavailable for this date/latitude.</div>${chabadLine}</div>`;
+    const diag = lastShabbatCalcError ? `<div class="hint-inline">${escapeHtml(lastShabbatCalcError)}</div>` : `<div class="hint-inline">Times unavailable for this date/latitude.</div>`;
+    return `<div class="zmanim-panel">${diag}${chabadLine}</div>`;
   }
   return chabadLine ? `<div class="zmanim-panel">${chabadLine}</div>` : '';
 }
@@ -1658,12 +1690,22 @@ function renderActivityPicker(stop, dayIndex) {
 
 /* ----- Attractions tab (attraction bank) ----- */
 
+function priorityBadge(priority) {
+  if (!priority) return '';
+  const p = priority.toLowerCase();
+  let cls = 'priority-other';
+  if (p.includes('must')) cls = 'priority-must';
+  else if (p.includes('recommend')) cls = 'priority-recommended';
+  else if (p.includes('time allow') || p.includes('optional')) cls = 'priority-optional';
+  return `<span class="priority-badge ${cls}">${escapeHtml(priority)}</span> `;
+}
+
 function renderAttractionsTab(stop) {
   const bank = stop.attractionBank || [];
   const rows = bank.length ? bank.map((a) => `
     <div class="card attr-card">
       <div class="attr-main">
-        <div class="attr-name">${escapeHtml(a.name)}</div>
+        <div class="attr-name">${priorityBadge(a.priority)}${escapeHtml(a.name)}</div>
         ${a.description ? `<div class="hint">${escapeHtml(a.description)}</div>` : ''}
         <div class="attr-meta">
           ${a.location ? `
@@ -1726,6 +1768,13 @@ function renderAttractionForm(existing) {
       <input name="description" value="${escapeAttr(a.description || '')}" placeholder="short description" />
       <label>Location (for the map link)</label>
       <input name="location" value="${escapeAttr(a.location || '')}" placeholder="e.g. Vinicunca, Cusco region" />
+      <label>Priority</label>
+      <select name="priority">
+        <option value="" ${!a.priority ? 'selected' : ''}>Not set</option>
+        <option value="Must-see" ${a.priority === 'Must-see' ? 'selected' : ''}>Must-see</option>
+        <option value="Recommended" ${a.priority === 'Recommended' ? 'selected' : ''}>Recommended</option>
+        <option value="If time allows" ${a.priority === 'If time allows' ? 'selected' : ''}>If time allows</option>
+      </select>
       <label>Guided tour or self-guided?</label>
       <select name="guidedOrSelf">
         ${GUIDED_OPTIONS.map((g) => `<option value="${g}" ${g === a.guidedOrSelf ? 'selected' : ''}>${g}</option>`).join('')}
@@ -1763,7 +1812,17 @@ function buildAiPrompt(stop) {
     ? `\n- Please focus specifically on ${focus}, not the whole country — we'll do other regions separately.`
     : `\n- ${stop.country} is a large, varied country — please pick a geographically sensible mix rather than scattering suggestions randomly across the whole country (mention which area/region each one is in).`;
 
-  return `I'm planning a family trip and need attraction/activity suggestions for ${placeLine}.
+  // Roughly 1.5 candidate suggestions per day gives enough to choose from and
+  // skip a few, without turning into a generic "top 20" list disconnected from
+  // how long we're actually there.
+  const suggestCount = Math.max(6, Math.min(16, Math.round(stop.durationDays * 1.5)));
+
+  return `I'm spending ${stop.durationDays} days in ${placeLine} as part of a longer family trip, and I want to make sure we don't miss what actually matters there — not a generic tourist list.
+
+Please act as a knowledgeable local trip-planning expert. Think it through properly:
+- What are the genuine must-see/must-do highlights of this specific place — the things that would be a real shame to miss?
+- Given we only have ${stop.durationDays} days, what's realistic to prioritize versus what's a nice-to-have if time and energy allow?
+- Include a mix of the famous essentials AND lesser-known local favorites, not just the obvious tourist checklist.
 
 Context:
 - Dates: ${withDates.startDate ? formatDate(withDates.startDate) + ' to ' + formatDate(withDates.endDate) : 'not yet set'} (${stop.durationDays} days)
@@ -1773,12 +1832,13 @@ Context:
 - Practical needs: road quality, child safety, nap disruption, and whether private transport helps should factor into suggestions
 - We keep Shabbat (no Friday-Saturday travel) and would like Chabad/kosher notes if relevant${focusNote}${existingLine}
 
-Please suggest 8-10 specific attractions/activities that fit this, covering a mix of nature, culture, food/market, and easy/light options — not all intensive excursions. Include at least one or two that take a full day or more if genuinely worthwhile (please say so explicitly if something needs more than one day).
+Please give me about ${suggestCount} specific suggestions, each clearly marked with a priority so I know what NOT to skip if we run short on time. Include at least one or two that genuinely take a full day or more if they're worth it (say so explicitly).
 
 VERY IMPORTANT — formatting instructions, please follow exactly:
-Reply in plain text only. Do NOT use markdown formatting — no headers (no #), no bold (no **), no bullet symbols. Just plain lines of text exactly as shown below, because I'm copying your reply directly into an app that reads this exact structure:
+Reply in plain text only. Do NOT use markdown formatting — no headers (no #), no bold (no **), no bullet symbols. And please put EACH LABEL BELOW ON ITS OWN NEW LINE — do not run them together in one paragraph, since my app reads this structure line by line:
 
 Attraction: [name of the place or activity]
+Priority: [Must-see / Recommended / If time allows]
 What: [one or two sentence description of what it is]
 Where: [as specific and exact a location/address as you can give — a precise place name, neighborhood, or landmark that would work typed directly into a map search, not just a vague area]
 Tour or self-guided: [Guided tour recommended / Can visit independently / Either works]
@@ -1788,13 +1848,15 @@ Cost estimate: [rough per-person cost if you have a sense of it, local currency 
 What to bring: [brief list — gear, altitude meds, cash, etc.]
 Notes: [child-suitability, booking-ahead needs, or anything else worth knowing]
 
-Leave one blank line between each attraction. Start every single one with the word "Attraction:" exactly like that, in plain text — this is how my app finds where each new suggestion starts. Please don't add any introduction, summary, or closing remarks — just the list of attractions in that exact format, nothing else.`;
+Leave a blank line between each attraction, and make sure every label above starts on its own new line within each one — nine separate lines per attraction, not one paragraph. Start every single one with the word "Attraction:" exactly like that, in plain text — this is how my app finds where each new suggestion starts. Please don't add any introduction, summary, or closing remarks — just the list of attractions in that exact format, nothing else.`;
 }
 
-/* ----- Smart parser for the structured AI reply ----- */
-// Understands the "### Title / What: / Where: / Tour or self-guided: / Getting there: /
-// What to bring: / Notes:" format from buildAiPrompt(). Falls back to one-attraction-per-line
-// for plain pasted lists that don't use that format, so nothing is ever lost.
+/* ----- Smart parser for the structured AI reply -----
+   Deliberately does NOT rely on line breaks to find field boundaries — many AI
+   replies (ChatGPT especially) run every label for one attraction into a single
+   flowing paragraph despite instructions, which would otherwise turn the whole
+   paragraph into one giant "title." Instead this scans for label text anywhere
+   in the reply and slices between whichever labels it actually finds. */
 
 function parseAiImportText(text) {
   // Strip markdown decoration that may or may not have survived copy-paste
@@ -1807,63 +1869,80 @@ function parseAiImportText(text) {
     .replace(/^[-•▪●]\s*/, '')
     .trim();
 
-  const rawLines = text.split('\n').map(cleanLine);
+  // IMPORTANT: many AI replies (ChatGPT especially) don't reliably put each
+  // "Label:" on its own line — they often run a whole attraction into one
+  // flowing paragraph: "Attraction: X What: Y Where: Z ...". Splitting by line
+  // then breaks completely (the entire paragraph becomes the "title"). So this
+  // parser does NOT rely on line breaks to find field boundaries at all — it
+  // searches for label text anywhere in the flattened text and slices between
+  // whichever labels it finds, in whatever order they actually appear.
+  const flatText = text.split('\n').map(cleanLine).join('\n');
 
-  const fieldPatterns = [
-    ['description', /^what:\s*(.*)$/i],
-    ['location', /^where:\s*(.*)$/i],
-    ['guidedOrSelf', /^tour or self-guided:\s*(.*)$/i],
-    ['gettingThere', /^getting there:\s*(.*)$/i],
-    ['suggestedDuration', /^suggested duration:\s*(.*)$/i],
-    ['costEstimate', /^cost estimate:\s*(.*)$/i],
-    ['whatToBring', /^what to bring:\s*(.*)$/i],
-    ['notes', /^notes:\s*(.*)$/i]
+  const LABELS = [
+    ['title', /attraction(?:\s*(?:name|title))?\s*:/i],
+    ['priority', /priority\s*:/i],
+    ['description', /what\s*:/i],
+    ['location', /where\s*:/i],
+    ['guidedOrSelf', /tour or self-guided\s*:/i],
+    ['gettingThere', /getting there\s*:/i],
+    ['suggestedDuration', /suggested duration\s*:/i],
+    ['costEstimate', /cost estimate\s*:/i],
+    ['whatToBring', /what to bring\s*:/i],
+    ['notes', /notes\s*:/i]
   ];
-  const titlePattern = /^attraction(?:\s*(?:name|title))?:\s*(.*)$/i;
 
-  const hasExplicitTitles = rawLines.some((l) => titlePattern.test(l));
-  const hasAnyFieldLabels = rawLines.some((l) => fieldPatterns.some(([, p]) => p.test(l)));
+  const matches = [];
+  LABELS.forEach(([field, pattern]) => {
+    const re = new RegExp(pattern.source, 'gi');
+    let m;
+    while ((m = re.exec(flatText))) {
+      matches.push({ field, start: m.index, end: m.index + m[0].length });
+    }
+  });
+  matches.sort((a, b) => a.start - b.start);
 
-  // Best case: the "Attraction: / What: / Where: ..." format came through
-  // (with or without markdown decoration — cleanLine already normalized it).
-  if (hasExplicitTitles) {
+  const hasTitleLabel = matches.some((m) => m.field === 'title');
+
+  // Best case: at least one "Attraction:" label found anywhere — use it as the
+  // block delimiter, and slice every other label's value from wherever it
+  // actually sits in the text, independent of line breaks.
+  if (hasTitleLabel) {
     const attractions = [];
     let current = null;
-    rawLines.forEach((line) => {
-      if (!line) return;
-      const titleMatch = line.match(titlePattern);
-      if (titleMatch && titleMatch[1]) {
+    matches.forEach((m, i) => {
+      const valueEnd = i + 1 < matches.length ? matches[i + 1].start : flatText.length;
+      const value = flatText.slice(m.end, valueEnd).replace(/\s+/g, ' ').trim();
+      if (m.field === 'title') {
         if (current && current.name) attractions.push(current);
-        current = Object.assign(defaultAttraction(), { name: titleMatch[1].trim(), source: 'ai-import' });
+        current = Object.assign(defaultAttraction(), { name: value, source: 'ai-import' });
         return;
       }
-      if (!current) return; // ignore any preamble before the first "Attraction:" line
-      let matched = false;
-      for (const [field, pattern] of fieldPatterns) {
-        const m = line.match(pattern);
-        if (m) {
-          current[field] = (current[field] ? current[field] + ' ' : '') + m[1].trim();
-          matched = true;
-          break;
-        }
-      }
-      if (!matched) current.notes = current.notes ? current.notes + ' ' + line : line;
+      if (!current) return; // ignore any preamble before the first "Attraction:" label
+      if (!value) return;
+      if (m.field === 'priority') { current.priority = value; return; }
+      current[m.field] = current[m.field] ? current[m.field] + ' ' + value : value;
     });
     if (current && current.name) attractions.push(current);
     return normalizeGuided(attractions);
   }
 
-  // Next best: no "Attraction:" labels, but the field labels (What:/Where:/etc.)
-  // are present — treat the first unlabeled line before each run of fields as
-  // that item's title.
+  // Next best: no "Attraction:" labels anywhere, but other field labels exist.
+  // This case still relies on line structure (there's no delimiter to anchor
+  // on otherwise) — a bare line before a run of recognized fields is that
+  // item's title.
+  const rawLines = flatText.split('\n');
+  const fieldPatterns = LABELS.filter(([f]) => f !== 'title' && f !== 'priority');
+  const hasAnyFieldLabels = rawLines.some((l) => fieldPatterns.some(([, p]) => new RegExp('^' + p.source, 'i').test(l)));
+
   if (hasAnyFieldLabels) {
     const attractions = [];
     let current = null;
-    rawLines.forEach((line) => {
+    rawLines.forEach((rawLine) => {
+      const line = rawLine.trim();
       if (!line) return;
       let matched = false;
       for (const [field, pattern] of fieldPatterns) {
-        const m = line.match(pattern);
+        const m = line.match(new RegExp('^' + pattern.source + '\\s*(.*)$', 'i'));
         if (m) {
           if (!current) current = Object.assign(defaultAttraction(), { name: 'Untitled suggestion', source: 'ai-import' });
           current[field] = (current[field] ? current[field] + ' ' : '') + m[1].trim();
@@ -1872,8 +1951,6 @@ function parseAiImportText(text) {
         }
       }
       if (matched) return;
-      // An unlabeled line: if the current item already has fields filled,
-      // this line starts a NEW item (its title). Otherwise it's this item's title.
       const hasContent = current && (current.description || current.location || current.gettingThere || current.whatToBring || current.notes);
       if (!current || hasContent) {
         if (current) attractions.push(current);
@@ -1934,6 +2011,7 @@ function renderAiReviewSection(stop) {
         <input type="text" data-action="review-field" data-field="name" data-idx="${idx}" value="${escapeAttr(it.name)}" class="review-name-input" />
         <button class="icon-btn" data-action="review-expand" data-idx="${idx}">${isOpen ? '▾' : '✎'}</button>
       </label>
+      ${it.priority ? `<div style="margin-bottom:4px">${priorityBadge(it.priority)}</div>` : ''}
       ${!isOpen ? `
         ${it.description ? `<div class="hint">${escapeHtml(it.description)}</div>` : ''}
         ${it.location ? `<div class="hint">📍 ${escapeHtml(it.location)}</div>` : ''}
@@ -3200,6 +3278,7 @@ function wireAttractionForm(stop, existing) {
       description: (fd.get('description') || '').trim(),
       location: (fd.get('location') || '').trim(),
       guidedOrSelf: fd.get('guidedOrSelf'),
+      priority: fd.get('priority') || '',
       gettingThere: (fd.get('gettingThere') || '').trim(),
       whatToBring: (fd.get('whatToBring') || '').trim(),
       durationMins: fd.get('durationMins') || '',
