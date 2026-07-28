@@ -1,6 +1,6 @@
 /* ---------- Data layer ---------- */
 
-const APP_VERSION = 'v12 · ' + '2026-07-27';
+const APP_VERSION = 'v13 · ' + '2026-07-28';
 const STORAGE_KEY = 'tripPlannerData_v1';
 
 const DAY_TYPES = [
@@ -13,6 +13,17 @@ const DAY_TYPES = [
   { value: 'shabbat-holiday', label: 'Shabbat / holiday day' },
   { value: 'buffer', label: 'Buffer day' }
 ];
+
+// Returns the day type that should be SHOWN/USED, without writing anything to
+// storage: an explicitly-set type always wins; otherwise Saturday defaults to
+// "Rest & family day" (per request — Shabbat is naturally a rest/family day),
+// and everything else defaults to "Not set" as before.
+function getEffectiveDayType(stop, dayIndex, dateIso) {
+  const stored = stop.dayTypes[dayIndex];
+  if (stored) return stored;
+  if (dateIso && new Date(dateIso + 'T00:00:00').getDay() === 6) return 'rest-family';
+  return 'unset';
+}
 
 const TRANSPORT_MODES = ['Flight', 'Train', 'Bus', 'Car rental', 'Taxi / rideshare', 'Private driver', 'Public transit', 'Ferry', 'Other'];
 const TRANSPORT_KINDS = ['Arrival', 'Local', 'Departure'];
@@ -57,6 +68,7 @@ function defaultAttraction() {
     gettingThere: '', whatToBring: '', notes: '', tags: [], source: 'manual', scheduledDay: null,
     geoLat: null, geoLon: null,
     durationMins: '', confirmation: '', bookingLink: '',
+    costEstimate: '', suggestedDuration: '', // freeform, AI-provided — not the structured cost/duration you confirm yourself
     cost: defaultCost()
   };
 }
@@ -67,6 +79,7 @@ function defaultStop() {
     dayTypes: {},
     workOverrides: {}, // { [dayIndex]: true } — explicitly skip the work target for that day
     daySchedule: {}, // { [dayIndex]: [ { id, type, label, startTime, endTime, attractionId, notes } ] }
+    aiRegionFocus: '', // optional — narrows the AI prompt to a region/city instead of the whole country
     attractionBank: [],
     accommodations: [],
     transport: [],
@@ -255,7 +268,9 @@ function readCostFields(fd) {
 function addDays(isoDate, days) {
   const d = new Date(isoDate + 'T00:00:00');
   d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+  return isoFromGregDate(d); // local date components — NOT toISOString(), which
+  // converts through UTC and silently shifts the date backward by a day in any
+  // positive-UTC-offset timezone (this broke Friday/Shabbat detection for Israel).
 }
 
 function formatDate(iso) {
@@ -402,7 +417,7 @@ function computeShabbatChagMap(stop, withDates) {
     // Add exact sunset for every day in range that matters (Fri/Sat/chag).
     // Computed separately because sunset isn't emitted as a calendar event.
     let cursor = withDates.startDate;
-    while (cursor && cursor < withDates.endDate) {
+    while (cursor && cursor <= withDates.endDate) {
       const d = new Date(cursor + 'T12:00:00');
       const dow = new Date(cursor + 'T00:00:00').getDay();
       const entry = map[cursor];
@@ -681,6 +696,40 @@ async function geocodeLocation(query) {
   return null;
 }
 
+// Looks up map coordinates for a batch of just-imported attractions automatically,
+// so you don't need to tap 🔎 on each one by hand. Runs one lookup at a time with
+// a pause between requests (Nominatim's free service asks for roughly one request
+// per second) — a few seconds for a typical batch of suggestions. Fails quietly
+// per-item (e.g. offline, or a name too vague to match) rather than blocking the rest.
+async function autoGeocodeNewAttractions(stopId, attractionIds) {
+  const stop = stopById(stopId);
+  if (!stop) return;
+  const targets = attractionIds
+    .map((id) => stop.attractionBank.find((a) => a.id === id))
+    .filter((a) => a && a.location && !a.geoLat);
+  if (!targets.length) return;
+
+  const isViewingThisTab = () => currentView === 'stop' && currentStopId === stopId && currentStopTab === 'attractions';
+  const setHint = (msg) => {
+    const el = document.getElementById('geocode-progress-hint');
+    if (el) el.textContent = msg;
+  };
+
+  for (let i = 0; i < targets.length; i++) {
+    if (isViewingThisTab()) setHint(`📍 Finding locations on the map… (${i + 1}/${targets.length})`);
+    const attr = targets[i];
+    const result = await geocodeLocation(attr.location + ', ' + stop.country);
+    if (result) {
+      attr.geoLat = result.lat;
+      attr.geoLon = result.lon;
+      saveData();
+      if (isViewingThisTab()) render();
+    }
+    if (i < targets.length - 1) await new Promise((r) => setTimeout(r, 1100));
+  }
+  if (isViewingThisTab()) setHint('');
+}
+
 function googleFlightsSearchUrl(detail) {
   return 'https://www.google.com/travel/flights?q=' + encodeURIComponent(detail || 'flights');
 }
@@ -831,7 +880,7 @@ function renderTodayCard(entry, label) {
     return `<div class="card"><div class="hint">${label}: outside your currently planned trip dates.</div></div>`;
   }
   const { stop, dayIndex, date } = entry;
-  const dayType = stop.dayTypes[dayIndex] || 'unset';
+  const dayType = getEffectiveDayType(stop, dayIndex, date);
   const dayTypeLabel = (DAY_TYPES.find((d) => d.value === dayType) || {}).label || 'Not set';
   const scheduled = (stop.attractionBank || []).filter((a) => a.scheduledDay === dayIndex);
   const accom = (stop.accommodations || []).find((a) => dayIndex >= a.startDayIndex && dayIndex < a.startDayIndex + a.nights);
@@ -884,9 +933,9 @@ function computeUrgentItems() {
         items.push({ severity: 'high', message: `No accommodation for ${formatDate(dateIso)} — ${stop.country}, Day ${dayIndex + 1}`, stopId: stop.id, tab: 'stay' });
       }
     }
-    const dayType = stop.dayTypes[dayIndex] || 'unset';
+    const dayType = getEffectiveDayType(stop, dayIndex, dateIso);
     const scheduled = (stop.attractionBank || []).filter((a) => a.scheduledDay === dayIndex);
-    if (!scheduled.length && !['travel', 'shabbat-holiday', 'buffer'].includes(dayType)) {
+    if (!scheduled.length && !['travel', 'shabbat-holiday', 'buffer', 'rest-family'].includes(dayType)) {
       items.push({ severity: 'info', message: `Nothing planned for ${formatDate(dateIso)} — ${stop.country}, Day ${dayIndex + 1}`, stopId: stop.id, tab: 'days' });
     }
   }
@@ -938,7 +987,7 @@ function renderWeekPage() {
     const withDates = stopWithDatesById(stop.id);
     const calMap = computeShabbatChagMap(stop, withDates);
     const flag = getDayFlag(calMap, dateIso);
-    const dayType = stop.dayTypes[dayIndex] || 'unset';
+    const dayType = getEffectiveDayType(stop, dayIndex, dateIso);
     const dayTypeLabel = (DAY_TYPES.find((t) => t.value === dayType) || {}).label || 'Not set';
     const conflicts = detectDayConflicts(stop, dayIndex, flag);
     const accom = (stop.accommodations || []).find((a) => dayIndex >= a.startDayIndex && dayIndex < a.startDayIndex + a.nights);
@@ -1029,10 +1078,6 @@ function renderRoute() {
   const list = stops.length
     ? stops.map((s, i) => `
       <div class="card stop-card" data-id="${s.id}">
-        <div class="reorder-btns">
-          <button class="icon-btn" data-action="up" data-id="${s.id}" ${i === 0 ? 'disabled style="opacity:.3"' : ''}>▲</button>
-          <button class="icon-btn" data-action="down" data-id="${s.id}" ${i === stops.length - 1 ? 'disabled style="opacity:.3"' : ''}>▼</button>
-        </div>
         <div class="stop-main" data-open-stop="${s.id}">
           <div class="country">${escapeHtml(s.country)}</div>
           <div class="dates">${start ? formatDate(s.startDate) + ' – ' + formatDate(s.endDate) + ' · ' : ''}${s.durationDays} days${s.notes ? ' · ' + escapeHtml(s.notes) : ''}</div>
@@ -1153,7 +1198,7 @@ function renderDaysTab(stop, withDates) {
 
   for (let i = 0; i < stop.durationDays; i++) {
     const date = withDates.startDate ? addDays(withDates.startDate, i) : '';
-    const dayType = stop.dayTypes[i] || 'unset';
+    const dayType = getEffectiveDayType(stop, i, date);
     const scheduled = (stop.attractionBank || []).filter((a) => a.scheduledDay === i);
     const accom = (stop.accommodations || []).find((a) => i >= a.startDayIndex && i < a.startDayIndex + a.nights);
     const flag = getDayFlag(calMap, date);
@@ -1423,7 +1468,7 @@ function renderDayPage() {
   const date = withDates.startDate ? addDays(withDates.startDate, i) : '';
   const calMap = computeShabbatChagMap(stop, withDates);
   const flag = getDayFlag(calMap, date);
-  const dayType = stop.dayTypes[i] || 'unset';
+  const dayType = getEffectiveDayType(stop, i, date);
   const accom = (stop.accommodations || []).find((a) => i >= a.startDayIndex && i < a.startDayIndex + a.nights);
   const scheduled = (stop.attractionBank || []).filter((a) => a.scheduledDay === i);
   const conflicts = detectDayConflicts(stop, i, flag);
@@ -1525,11 +1570,19 @@ function renderDayScheduleSection(stop, dayIndex, flag) {
   const mode = dayViewMode[dayIndex] || 'timeline';
   const blocks = (stop.daySchedule[dayIndex] || []).slice().sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
 
-  const listRows = blocks.length ? blocks.map((b) => `
-    <div class="sched-row">
+  // Virtual default work blocks belong in the list too, not just the timeline —
+  // otherwise "the default only shows at the top of the day" is exactly what happens.
+  const workEligible = isWorkEligibleDay(stop, dayIndex, flag);
+  const defaultRows = workEligible ? workDefaultIntervals().map((iv) => ({
+    isDefault: true, type: 'Work', label: 'Work (default)', startTime: iv.startTime, endTime: iv.endTime
+  })) : [];
+  const combined = [...blocks, ...defaultRows].sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
+
+  const listRows = combined.length ? combined.map((b) => `
+    <div class="sched-row ${b.isDefault ? 'sched-row-default' : ''}">
       <div class="sched-time">${b.startTime || '?'}${b.endTime ? '–' + b.endTime : ''}</div>
       <div class="sched-label"><span class="sched-type">${escapeHtml(b.type)}</span>${b.label ? ' · ' + escapeHtml(b.label) : ''}${b.notes ? ' · ' + escapeHtml(b.notes) : ''}</div>
-      <button class="icon-btn" data-action="delete-block" data-day="${dayIndex}" data-block-id="${b.id}">✕</button>
+      ${b.isDefault ? '' : `<button class="icon-btn" data-action="delete-block" data-day="${dayIndex}" data-block-id="${b.id}">✕</button>`}
     </div>
   `).join('') : '<div class="hint-inline">No time blocks yet — add work, meals, sleep, travel, or attractions below.</div>';
 
@@ -1643,14 +1696,17 @@ function renderAttractionsTab(stop) {
 
     <div class="section-title">AI research helper</div>
     <div class="card">
-      <p class="hint">Build a ready-to-use prompt for this country, copy it into Claude (or any AI), then paste the full reply back in below — each suggestion becomes its own attraction, with location, tour info, getting there, and what to bring already filled in.</p>
-      <button class="btn btn-secondary" id="btn-build-ai-prompt">Build AI prompt for ${escapeHtml(stop.country)}</button>
+      <p class="hint">Build a ready-to-use prompt for this country, copy it into Claude (or any AI), then paste the full reply back in below — each suggestion becomes its own attraction, with location, tour info, cost/duration estimates, getting there, and what to bring already filled in.</p>
+      <label class="hint" style="display:block;margin:8px 0 4px">Narrow to a region/city (optional — leave blank for the whole country)</label>
+      <input type="text" id="ai-region-focus" value="${escapeAttr(stop.aiRegionFocus || '')}" placeholder="e.g. Cusco region, Sacred Valley" />
+      <button class="btn btn-secondary" id="btn-build-ai-prompt" style="margin-top:10px">Build AI prompt</button>
       <div id="ai-prompt-slot"></div>
     </div>
     <div class="card">
       <label>Paste the AI's full reply here</label>
       <textarea id="ai-import-text" rows="6" placeholder="Paste the AI's structured reply here (or a plain list — that still works too)"></textarea>
       <button class="btn btn-primary" id="btn-import-ai-list" style="margin-top:8px">Preview import</button>
+      <p class="hint" id="geocode-progress-hint" style="margin-top:8px"></p>
     </div>
     <div id="ai-review-slot">${(aiReviewItems && aiReviewStopId === stop.id) ? renderAiReviewSection(stop) : ''}</div>
 
@@ -1701,8 +1757,13 @@ function buildAiPrompt(stop) {
   const existingLine = existingNames.length
     ? `\n- Already on our list, please don't repeat these: ${existingNames.join(', ')}`
     : '';
+  const focus = (stop.aiRegionFocus || '').trim();
+  const placeLine = focus ? `${focus} (${stop.country})` : stop.country;
+  const focusNote = focus
+    ? `\n- Please focus specifically on ${focus}, not the whole country — we'll do other regions separately.`
+    : `\n- ${stop.country} is a large, varied country — please pick a geographically sensible mix rather than scattering suggestions randomly across the whole country (mention which area/region each one is in).`;
 
-  return `I'm planning a family trip and need attraction/activity suggestions for ${stop.country}.
+  return `I'm planning a family trip and need attraction/activity suggestions for ${placeLine}.
 
 Context:
 - Dates: ${withDates.startDate ? formatDate(withDates.startDate) + ' to ' + formatDate(withDates.endDate) : 'not yet set'} (${stop.durationDays} days)
@@ -1710,18 +1771,20 @@ Context:
 - Style: slow travel, dramatic nature, authentic local culture, villages, markets, crafts, indigenous-led or community-run tourism; avoid staged/touristy experiences, shopping malls, and nightlife
 - Budget-conscious — prefer a realistic mix, not just premium/expensive options
 - Practical needs: road quality, child safety, nap disruption, and whether private transport helps should factor into suggestions
-- We keep Shabbat (no Friday-Saturday travel) and would like Chabad/kosher notes if relevant${existingLine}
+- We keep Shabbat (no Friday-Saturday travel) and would like Chabad/kosher notes if relevant${focusNote}${existingLine}
 
-Please suggest 8-10 specific attractions/activities in ${stop.country} that fit this, covering a mix of nature, culture, food/market, and easy/light options — not all intensive excursions.
+Please suggest 8-10 specific attractions/activities that fit this, covering a mix of nature, culture, food/market, and easy/light options — not all intensive excursions. Include at least one or two that take a full day or more if genuinely worthwhile (please say so explicitly if something needs more than one day).
 
 VERY IMPORTANT — formatting instructions, please follow exactly:
 Reply in plain text only. Do NOT use markdown formatting — no headers (no #), no bold (no **), no bullet symbols. Just plain lines of text exactly as shown below, because I'm copying your reply directly into an app that reads this exact structure:
 
 Attraction: [name of the place or activity]
 What: [one or two sentence description of what it is]
-Where: [specific place/neighborhood name, for a map search]
+Where: [as specific and exact a location/address as you can give — a precise place name, neighborhood, or landmark that would work typed directly into a map search, not just a vague area]
 Tour or self-guided: [Guided tour recommended / Can visit independently / Either works]
 Getting there: [how to get there from a typical base, and travel time]
+Suggested duration: [e.g. "2-3 hours", "half day", "full day", "2 days" — be explicit if it needs more than one day]
+Cost estimate: [rough per-person cost if you have a sense of it, local currency or USD — say "free" or "unclear" rather than guessing wildly]
 What to bring: [brief list — gear, altitude meds, cash, etc.]
 Notes: [child-suitability, booking-ahead needs, or anything else worth knowing]
 
@@ -1751,6 +1814,8 @@ function parseAiImportText(text) {
     ['location', /^where:\s*(.*)$/i],
     ['guidedOrSelf', /^tour or self-guided:\s*(.*)$/i],
     ['gettingThere', /^getting there:\s*(.*)$/i],
+    ['suggestedDuration', /^suggested duration:\s*(.*)$/i],
+    ['costEstimate', /^cost estimate:\s*(.*)$/i],
     ['whatToBring', /^what to bring:\s*(.*)$/i],
     ['notes', /^notes:\s*(.*)$/i]
   ];
@@ -1872,14 +1937,26 @@ function renderAiReviewSection(stop) {
       ${!isOpen ? `
         ${it.description ? `<div class="hint">${escapeHtml(it.description)}</div>` : ''}
         ${it.location ? `<div class="hint">📍 ${escapeHtml(it.location)}</div>` : ''}
+        ${it.suggestedDuration ? `<div class="hint">⏱ ${escapeHtml(it.suggestedDuration)}</div>` : ''}
+        ${it.costEstimate ? `<div class="hint">💰 ${escapeHtml(it.costEstimate)} <span class="ai-est-tag">AI estimate</span></div>` : ''}
         ${it.gettingThere ? `<div class="hint">🚗 ${escapeHtml(it.gettingThere)}</div>` : ''}
         ${it.whatToBring ? `<div class="hint">🎒 ${escapeHtml(it.whatToBring)}</div>` : ''}
         ${it.notes ? `<div class="hint">${escapeHtml(it.notes)}</div>` : ''}
       ` : `
         <label class="hint" style="display:block;margin-top:6px">What</label>
         <textarea data-action="review-field" data-field="description" data-idx="${idx}" rows="2">${escapeHtml(it.description || '')}</textarea>
-        <label class="hint" style="display:block;margin-top:6px">Where</label>
+        <label class="hint" style="display:block;margin-top:6px">Where (used to find it on the map)</label>
         <input type="text" data-action="review-field" data-field="location" data-idx="${idx}" value="${escapeAttr(it.location || '')}" />
+        <div class="form-row">
+          <div>
+            <label class="hint" style="display:block;margin-top:6px">Suggested duration</label>
+            <input type="text" data-action="review-field" data-field="suggestedDuration" data-idx="${idx}" value="${escapeAttr(it.suggestedDuration || '')}" />
+          </div>
+          <div>
+            <label class="hint" style="display:block;margin-top:6px">Cost estimate (AI, unverified)</label>
+            <input type="text" data-action="review-field" data-field="costEstimate" data-idx="${idx}" value="${escapeAttr(it.costEstimate || '')}" />
+          </div>
+        </div>
         <label class="hint" style="display:block;margin-top:6px">Getting there</label>
         <input type="text" data-action="review-field" data-field="gettingThere" data-idx="${idx}" value="${escapeAttr(it.gettingThere || '')}" />
         <label class="hint" style="display:block;margin-top:6px">What to bring</label>
@@ -1933,10 +2010,12 @@ function attachAiReviewHandlers(stop) {
     const toAdd = aiReviewItems.filter((it) => it._include);
     if (!toAdd.length) { toast('Nothing selected to add.'); return; }
     pushUndo('import attractions from AI');
+    const addedIds = [];
     toAdd.forEach((it) => {
       const clean = Object.assign(defaultAttraction(), it, { id: uid('attr') });
       delete clean._include;
       stop.attractionBank.push(clean);
+      addedIds.push(clean.id);
     });
     saveData();
     toastWithUndo(`Added ${toAdd.length} attraction${toAdd.length === 1 ? '' : 's'}.`);
@@ -1944,6 +2023,7 @@ function attachAiReviewHandlers(stop) {
     aiReviewStopId = null;
     reviewExpanded = new Set();
     render();
+    autoGeocodeNewAttractions(stop.id, addedIds); // background — commit itself is instant
   });
 
   const cancelBtn = document.getElementById('btn-cancel-ai-review');
@@ -2451,6 +2531,30 @@ function renderFlightsBookings() {
   const flights = data.awardFlights || [];
   const bookings = data.bookings || [];
 
+  // Points tracked per program — deliberately separate from the dollar budget,
+  // since points from different programs aren't fungible and shouldn't be summed together.
+  const pointsByProgram = {};
+  flights.forEach((f) => {
+    if (!f.program || !f.pointsPerPerson) return;
+    const totalPts = Number(f.pointsPerPerson) * (Number(f.passengers) || 1);
+    if (!pointsByProgram[f.program]) pointsByProgram[f.program] = { total: 0, count: 0 };
+    pointsByProgram[f.program].total += totalPts;
+    pointsByProgram[f.program].count += 1;
+  });
+  const pointsRows = Object.entries(pointsByProgram);
+  const pointsSummary = pointsRows.length ? `
+    <div class="section-title">Points tracked (separate from $ budget)</div>
+    <div class="card">
+      ${pointsRows.map(([program, v]) => `
+        <div class="cat-row">
+          <div class="cat-label">${escapeHtml(program)}</div>
+          <div class="cat-amount" style="flex:1;text-align:left">${v.total.toLocaleString()} pts</div>
+          <div class="hint">${v.count} flight${v.count === 1 ? '' : 's'}</div>
+        </div>
+      `).join('')}
+    </div>
+  ` : '';
+
   const flightRows = flights.length ? [...flights].sort((a, b) => (a.bookingDeadline || '9999').localeCompare(b.bookingDeadline || '9999')).map((f) => `
     <div class="card">
       <div class="attr-main">
@@ -2486,6 +2590,7 @@ function renderFlightsBookings() {
   `).join('') : `<div class="empty-state">No bookings tracked yet.</div>`;
 
   return `
+    ${pointsSummary}
     <div class="section-title">Award flights</div>
     <button class="btn btn-primary btn-block" id="btn-add-flight">+ Track an award flight</button>
     <div id="flight-form-slot"></div>
@@ -2836,8 +2941,6 @@ function attachRouteHandlers() {
     document.getElementById('stop-form-slot').innerHTML = renderStopForm(null);
     wireStopForm(null);
   });
-  document.querySelectorAll('[data-action="up"]').forEach((b) => b.addEventListener('click', () => moveStop(b.dataset.id, -1)));
-  document.querySelectorAll('[data-action="down"]').forEach((b) => b.addEventListener('click', () => moveStop(b.dataset.id, 1)));
   document.querySelectorAll('[data-action="delete"]').forEach((b) => b.addEventListener('click', () => deleteStop(b.dataset.id)));
   document.querySelectorAll('[data-action="edit"]').forEach((b) => b.addEventListener('click', () => {
     const stop = stopById(b.dataset.id);
@@ -2875,15 +2978,6 @@ function wireStopForm(existing) {
   document.getElementById('cancel-stop-form').addEventListener('click', () => {
     document.getElementById('stop-form-slot').innerHTML = '';
   });
-}
-
-function moveStop(id, direction) {
-  const idx = data.stops.findIndex((s) => s.id === id);
-  const swapWith = idx + direction;
-  if (swapWith < 0 || swapWith >= data.stops.length) return;
-  [data.stops[idx], data.stops[swapWith]] = [data.stops[swapWith], data.stops[idx]];
-  saveData();
-  render();
 }
 
 function deleteStop(id) {
@@ -3061,6 +3155,11 @@ function attachAttractionsHandlers(stop) {
 
   const promptBtn = document.getElementById('btn-build-ai-prompt');
   if (promptBtn) promptBtn.addEventListener('click', () => {
+    const regionInput = document.getElementById('ai-region-focus');
+    if (regionInput) {
+      stop.aiRegionFocus = regionInput.value.trim();
+      saveData();
+    }
     const prompt = buildAiPrompt(stop);
     document.getElementById('ai-prompt-slot').innerHTML = `
       <textarea id="ai-prompt-text" rows="10" readonly>${escapeHtml(prompt)}</textarea>
