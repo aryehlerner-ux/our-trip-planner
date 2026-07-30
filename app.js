@@ -1,6 +1,6 @@
 /* ---------- Data layer ---------- */
 
-const APP_VERSION = 'v15 · ' + '2026-07-28';
+const APP_VERSION = 'v16 · ' + '2026-07-30';
 const STORAGE_KEY = 'tripPlannerData_v1';
 
 const DAY_TYPES = [
