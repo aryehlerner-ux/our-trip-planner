@@ -1,14 +1,14 @@
-const CACHE_NAME = 'trip-planner-v16';
+const CACHE_NAME = 'trip-planner-v17';
 const ASSETS = [
   './',
   './index.html',
-  './app.js?v=16',
-  './style.css?v=16',
+  './app.js?v=17',
+  './style.css?v=17',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
-  './hebcal-bundle.js?v=16',
-  './country-data.js?v=16'
+  './hebcal-bundle.js?v=17',
+  './country-data.js?v=17'
 ];
 
 self.addEventListener('install', (event) => {

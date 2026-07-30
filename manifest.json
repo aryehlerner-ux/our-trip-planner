@@ -3,8 +3,8 @@
   "short_name": "TripPlanner",
   "start_url": "./index.html",
   "display": "standalone",
-  "background_color": "#fef9ef",
-  "theme_color": "#2b6777",
+  "background_color": "#F8F7F3",
+  "theme_color": "#147D75",
   "orientation": "portrait",
   "icons": [
     { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
