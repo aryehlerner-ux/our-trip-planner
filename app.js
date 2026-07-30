@@ -1,6 +1,6 @@
 /* ---------- Data layer ---------- */
 
-const APP_VERSION = 'v14 · ' + '2026-07-28';
+const APP_VERSION = 'v15 · ' + '2026-07-28';
 const STORAGE_KEY = 'tripPlannerData_v1';
 
 const DAY_TYPES = [
@@ -674,12 +674,29 @@ let currentStopId = null;
 let currentStopTab = 'days'; // days | attractions | stay | transport | map | info
 let currentDayIndex = null;
 
+// Positions the sliding glass pill under whichever nav button is active —
+// the app's one signature motion. Uses real layout measurement rather than
+// fixed math so it stays correct regardless of safe-area insets or font scaling.
+function updateNavIndicator() {
+  const nav = document.querySelector('nav.bottom-nav');
+  const indicator = document.getElementById('nav-indicator');
+  if (!nav || !indicator) return;
+  const activeBtn = nav.querySelector('button.active');
+  if (!activeBtn) { indicator.style.opacity = '0'; return; }
+  const navRect = nav.getBoundingClientRect();
+  const btnRect = activeBtn.getBoundingClientRect();
+  indicator.style.opacity = '1';
+  indicator.style.width = btnRect.width + 'px';
+  indicator.style.transform = `translateX(${btnRect.left - navRect.left}px)`;
+}
+
 function setView(view) {
   currentView = view;
   currentStopId = null;
   document.querySelectorAll('nav.bottom-nav button').forEach((b) =>
     b.classList.toggle('active', b.dataset.view === view)
   );
+  updateNavIndicator();
   render();
 }
 
@@ -692,6 +709,7 @@ function openStop(id) {
   aiReviewStopId = null;
   reviewExpanded = new Set();
   document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.remove('active'));
+  updateNavIndicator();
   render();
 }
 
@@ -700,12 +718,14 @@ function openDayPage(stopId, dayIndex) {
   currentStopId = stopId;
   currentDayIndex = dayIndex;
   document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.remove('active'));
+  updateNavIndicator();
   render();
 }
 
 function openWeekPage() {
   currentView = 'week';
   document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.remove('active'));
+  updateNavIndicator();
   render();
 }
 
@@ -3648,6 +3668,8 @@ document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.addEventList
 const versionBadge = document.getElementById('version-badge');
 if (versionBadge) versionBadge.textContent = APP_VERSION;
 render();
+updateNavIndicator();
+window.addEventListener('resize', updateNavIndicator);
 
 if (!data.meta.fxRates) {
   refreshFxRates(true);
